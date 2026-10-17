@@ -14,8 +14,11 @@ version, or the newest nightly while there is none; !release #355 pull request 3
 request's builds are releases of LINKBOT_NIGHTLY (OWNER/nightly by default), as ScarletNX's publish workflow makes them.
 
 What it reads: the text of messages in the channels it is in (LINKBOT_CHANNELS narrows them), only to find those
-references. It keeps nothing: no message, no author, no log of what was said. It asks GitHub for the numbers it
-found, and remembers their answers CACHE seconds. Its replies ping no one.
+references. It keeps no message text, no author and no log of what was said. It asks GitHub for the numbers it found
+and remembers each answer, an open one CACHE seconds and a closed or merged one SETTLED. With LINKBOT_STATE, a file,
+those answers outlive a restart, and so do its replies of the last AGE days, as their channel and message ids and the
+numbers in them: with GITHUB_TOKEN it asks again every REFRESH seconds and edits a reply whose items changed (without
+a token GitHub allows 60 questions an hour, so its replies stay as sent). Its replies ping no one.
 """
 
 import asyncio
@@ -29,6 +32,7 @@ import urllib.error
 import urllib.request
 
 MOST, CACHE, FILES = 5, 600, 12
+SETTLED, AGE, TRACK, REFRESH = 86400, 7 * 86400, 200, 600
 # #160, as in issue #160 or PR #160; not inside a word, a path or a link. A bare 160 is not one: "pr 2 broke" is talk
 REFERENCE = re.compile(r'(?<![\w/#&])#(\d{1,6})\b')
 # the whole message: !nightly, !release, or !release #N
@@ -134,11 +138,11 @@ def note(text):
 class GitHub:
     """issues and pull requests by number, and releases, through GitHub's REST API, remembered CACHE seconds"""
 
-    def __init__(self, repo, token='', fetch=None, clock=time.monotonic, nightly=''):
+    def __init__(self, repo, token='', fetch=None, clock=time.time, nightly='', items=None):
         self.repo, self.token, self.clock = repo, token, clock
         self.nightly = nightly or repo.split('/')[0] + '/nightly'
         self.fetch = fetch or self.http
-        self.cache = {}
+        self.cache = {int(number): tuple(kept) for number, kept in (items or {}).items()}
 
     def http(self, url):
         headers = {'Accept': 'application/vnd.github+json', 'User-Agent': 'scarletnx-linkbot'}
@@ -155,8 +159,12 @@ class GitHub:
     def item(self, number):
         """the issue or pull request number is, or None when there is none"""
         now = self.clock()
-        if number in self.cache and now - self.cache[number][0] < CACHE:
-            return self.cache[number][1]
+        if number in self.cache:
+            then, found = self.cache[number]
+            if now - then < (
+                SETTLED if found and state(found) in ('merged', 'closed', 'done', 'not planned') else CACHE
+            ):
+                return found
         found = self.fetch(f'https://api.github.com/repos/{self.repo}/issues/{number}')
         if found and found.get('pull_request'):  # whether it merged, and whether it is a draft, are the PR's
             pull = self.fetch(f'https://api.github.com/repos/{self.repo}/pulls/{number}') or {}
@@ -174,6 +182,59 @@ class GitHub:
         found = self.fetch(url)
         self.cache[url] = (now, found)
         return found
+
+    def items(self):
+        """what GitHub said of each number, to keep in the state file"""
+        return {str(n): list(kept) for n, kept in self.cache.items() if isinstance(n, int) and kept[1]}
+
+
+class Replies:
+    """its replies that name items, kept AGE days at most TRACK of them: [when, channel id, message id, numbers, embed]"""
+
+    def __init__(self, kept=None, clock=time.time):
+        self.kept, self.clock = [list(entry) for entry in (kept or [])], clock
+
+    def keep(self, where, numbers, embed):
+        self.kept.append([self.clock(), where[0], where[1], list(numbers), embed])
+        del self.kept[:-TRACK]
+
+    def drop(self, channel, message):
+        self.kept = [entry for entry in self.kept if (entry[1], entry[2]) != (channel, message)]
+
+    async def changed(self, github):
+        """(channel id, message id, embed) for each kept reply whose items read differently now; older ones dropped"""
+        now, loop, edits = self.clock(), asyncio.get_running_loop(), []
+        self.kept = [entry for entry in self.kept if now - entry[0] < AGE]
+        for entry in self.kept:
+            items = [await loop.run_in_executor(None, github.item, number) for number in entry[3]]
+            items = [item for item in items if item]
+            if items and reply(items) != entry[4]:
+                entry[4] = reply(items)
+                edits.append((entry[1], entry[2], entry[4]))
+        return edits
+
+
+class State:
+    """the state file: GitHub's answers and the kept replies, as JSON; none when it is unset, missing or unreadable"""
+
+    def __init__(self, path):
+        self.path = path
+
+    def load(self):
+        try:
+            with open(self.path, encoding='utf-8') as file:
+                state = json.load(file)
+            return state if isinstance(state, dict) else {}
+        except (OSError, ValueError, TypeError):
+            return {}
+
+    def save(self, github, replies):
+        if not self.path:
+            return
+        temporary = f'{self.path}.new'
+        with open(temporary, 'w', encoding='utf-8') as file:
+            json.dump({'items': github.items(), 'replies': replies.kept}, file)
+        os.replace(temporary, self.path)
 
 
 async def command(message_text, github, send):
@@ -206,9 +267,9 @@ async def command(message_text, github, send):
     return True
 
 
-async def answer(message_text, github, send):
-    """the reply to a message: a command's, else the items it names, sent through send(embed dict); whether one was
-    sent"""
+async def answer(message_text, github, send, replies=None):
+    """the reply to a message: a command's, else the items it names, sent through send(embed dict), which gives back
+    where it went, (channel id, message id), for replies to keep; whether one was sent"""
     if await command(message_text, github, send):
         return True
     numbers = references(message_text)
@@ -218,7 +279,10 @@ async def answer(message_text, github, send):
     items = [i for i in await asyncio.gather(*(loop.run_in_executor(None, github.item, n) for n in numbers)) if i]
     if not items:
         return False
-    await send(reply(items))
+    embed = reply(items)
+    where = await send(embed)
+    if replies is not None and where:
+        replies.keep(where, [item['number'] for item in items], embed)
     return True
 
 
@@ -232,14 +296,41 @@ def main():
     nightly = os.environ.get('LINKBOT_NIGHTLY', '')
     if nightly and not re.fullmatch(r'[\w.-]+/[\w.-]+', nightly):
         sys.exit('linkbot: LINKBOT_NIGHTLY is OWNER/NAME')
-    github = GitHub(repo, os.environ.get('GITHUB_TOKEN', ''), nightly=nightly)
+    state = State(os.environ.get('LINKBOT_STATE', ''))
+    saved = state.load()
+    github = GitHub(repo, os.environ.get('GITHUB_TOKEN', ''), nightly=nightly, items=saved.get('items'))
+    replies = Replies(saved.get('replies'))
     intents = discord.Intents.none()
     intents.guilds = intents.guild_messages = intents.message_content = True
     client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
 
+    def saved_now():
+        try:
+            state.save(github, replies)
+        except OSError as error:
+            print(f'linkbot: {state.path}: {error}', file=sys.stderr, flush=True)
+
+    async def refresh():
+        while True:
+            await asyncio.sleep(REFRESH)
+            for channel, message, embed in await replies.changed(github):
+                try:
+                    where = client.get_channel(channel) or await client.fetch_channel(channel)
+                    await where.get_partial_message(message).edit(embed=discord.Embed.from_dict(embed))
+                except discord.NotFound:  # the reply, or its channel, is gone
+                    replies.drop(channel, message)
+                except Exception as error:  # noqa: BLE001 - one edit never stops the others
+                    print(f'linkbot: edit: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
+            saved_now()
+
     @client.event
     async def on_ready():
         print(f'linkbot: up as {client.user} for {repo}', flush=True)
+        if github.token and not getattr(client, 'refreshing', False):
+            client.refreshing = True
+            asyncio.get_running_loop().create_task(refresh())
+        elif not github.token:
+            print('linkbot: no GITHUB_TOKEN: its replies stay as sent', flush=True)
 
     @client.event
     async def on_message(message):
@@ -247,10 +338,12 @@ def main():
             return
 
         async def send(embed):
-            await message.reply(embed=discord.Embed.from_dict(embed), mention_author=False)
+            sent = await message.reply(embed=discord.Embed.from_dict(embed), mention_author=False)
+            return sent.channel.id, sent.id
 
         try:
-            await answer(message.content, github, send)
+            if await answer(message.content, github, send, replies):
+                saved_now()
         except Exception as error:  # noqa: BLE001 - one message never stops the bot; said in the log, not the channel
             print(f'linkbot: {type(error).__name__}: {error}', file=sys.stderr, flush=True)
 

@@ -76,11 +76,12 @@ class Lookup(unittest.TestCase):
     def setUp(self):
         self.asked = []
         self.now = [0.0]
+        self.issue = dict(ISSUE)
 
         def fetch(url):
             self.asked.append(url)
             if url.endswith('/issues/160'):
-                return dict(ISSUE)
+                return dict(self.issue)
             if url.endswith('/issues/305'):
                 return dict(PULL, pull_request={'url': 'x'})
             if url.endswith('/pulls/305'):
@@ -92,12 +93,83 @@ class Lookup(unittest.TestCase):
     def test_pull_request_asked_whether_it_merged(self):
         self.assertEqual(linkbot.state(self.github.item(305)), 'merged')
 
-    def test_remembered_then_asked_again(self):
+    def asked_160(self):
+        return self.asked.count('https://api.github.com/repos/o/r/issues/160')
+
+    def test_an_open_one_is_asked_again_after_cache(self):
+        self.issue['state'] = 'open'
         self.github.item(160)
         self.github.item(160)
         self.now[0] += linkbot.CACHE + 1
         self.github.item(160)
-        self.assertEqual(self.asked.count('https://api.github.com/repos/o/r/issues/160'), 2)
+        self.assertEqual(self.asked_160(), 2)
+
+    def test_a_closed_one_is_asked_again_only_after_settled(self):
+        self.github.item(160)
+        self.now[0] += linkbot.CACHE + 1
+        self.github.item(160)
+        self.assertEqual(self.asked_160(), 1)
+        self.now[0] += linkbot.SETTLED
+        self.github.item(160)
+        self.assertEqual(self.asked_160(), 2)
+
+    def test_a_reply_is_kept_and_edited_when_its_item_changes(self):
+        replies = linkbot.Replies(clock=lambda: self.now[0])
+
+        async def send(embed):
+            return (7, 70)
+
+        self.issue['state'] = 'open'
+        asyncio.run(linkbot.answer('#160 and #999', self.github, send, replies))
+        self.assertEqual(replies.kept[0][1:4], [7, 70, [160]])
+        self.assertEqual(asyncio.run(replies.changed(self.github)), [])  # nothing changed
+        self.issue['state'], self.issue['state_reason'] = 'closed', 'completed'
+        self.now[0] += linkbot.CACHE
+        edits = asyncio.run(replies.changed(self.github))
+        self.assertEqual([(c, m) for c, m, _ in edits], [(7, 70)])
+        self.assertIn('(done)', edits[0][2]['description'])
+        self.now[0] += linkbot.AGE
+        self.assertEqual(asyncio.run(replies.changed(self.github)), [])
+        self.assertEqual(replies.kept, [])  # too old to edit: dropped
+
+    def test_a_command_reply_is_not_kept(self):
+        replies = linkbot.Replies()
+
+        async def send(embed):
+            return (7, 71)
+
+        asyncio.run(linkbot.answer('!nightly', self.github, send, replies))
+        self.assertEqual(replies.kept, [])
+
+    def test_at_most_track_replies_are_kept(self):
+        replies = linkbot.Replies()
+        for i in range(linkbot.TRACK + 3):
+            replies.keep((1, i), [160], {})
+        self.assertEqual((len(replies.kept), replies.kept[0][2]), (linkbot.TRACK, 3))
+
+    def test_the_state_file_keeps_answers_and_replies_and_nothing_else(self):
+        import os
+        import tempfile
+
+        replies = linkbot.Replies(clock=lambda: self.now[0])
+        self.github.item(160)
+        self.github.item(999)  # GitHub knows no 999: nothing to keep
+        replies.keep((7, 70), [160], {'description': 'x'})
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'state.json')
+            linkbot.State(path).save(self.github, replies)
+            saved = linkbot.State(path).load()
+            self.assertEqual(sorted(saved), ['items', 'replies'])
+            self.assertEqual(list(saved['items']), ['160'])
+            again = linkbot.GitHub(
+                'o/r', fetch=lambda url: self.fail(url), clock=lambda: self.now[0], items=saved['items']
+            )
+            self.assertEqual(again.item(160)['number'], 160)  # from the file, not asked
+            self.assertEqual(linkbot.Replies(saved['replies']).kept, replies.kept)
+            with open(path, 'w') as file:
+                file.write('{not json')
+            self.assertEqual(linkbot.State(path).load(), {})
+        self.assertEqual(linkbot.State('').load(), {})
 
     def test_answer_leaves_out_numbers_github_does_not_know(self):
         sent = []
