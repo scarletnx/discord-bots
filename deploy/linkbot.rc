@@ -1,0 +1,31 @@
+#!/bin/sh
+# PROVIDE: linkbot
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# The linkbot Discord bot, run by daemon(8) as the linkbot user, started again when it stops; its output in syslog.
+# Its tokens are in linkbot_env_file (root's, mode 600), which rc.subr exports to it.
+
+. /etc/rc.subr
+
+name=linkbot
+rcvar=linkbot_enable
+load_rc_config $name
+
+: ${linkbot_enable:=NO}
+: ${linkbot_env_file:=/usr/local/etc/linkbot.env}
+
+pidfile=/var/run/${name}.pid
+command=/usr/sbin/daemon
+command_args="-r -R 30 -S -T ${name} -u ${name} -P ${pidfile} /usr/local/bin/python3.12 /usr/local/libexec/${name}.py"
+start_precmd="${name}_precmd"
+
+linkbot_precmd()
+{
+	if [ ! -s "${linkbot_env_file}" ] || grep -q '=$' "${linkbot_env_file}"; then
+		echo "${linkbot_env_file} lacks a value: fill it in first"
+		return 1
+	fi
+}
+
+run_rc_command "$1"
