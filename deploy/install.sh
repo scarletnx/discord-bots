@@ -34,6 +34,7 @@ for bot in linkbot xuji; do
 		install -m 600 "$here/$bot.env.example" "$root/usr/local/etc/$bot.env"
 		echo "$bot: fill in $root/usr/local/etc/$bot.env, then: bastille cmd $jail service $bot start"
 	fi
-	bastille sysrc "$jail" "${bot}_enable=YES" >/dev/null
+	# on at its first install; a NO set since (the bot left off) stays
+	jexec "$jail" sysrc -n "${bot}_enable" >/dev/null 2>&1 || bastille sysrc "$jail" "${bot}_enable=YES" >/dev/null
 done
 echo "$jail: installed"
