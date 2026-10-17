@@ -334,7 +334,8 @@ def main():
 
     @client.event
     async def on_message(message):
-        if message.author.bot or (channels and message.channel.id not in channels):
+        # a bot's or a webhook's message (the GitHub cards) is never answered
+        if message.author.bot or message.webhook_id or (channels and message.channel.id not in channels):
             return
 
         async def send(embed):
