@@ -30,7 +30,7 @@ PULL = {
 class References(unittest.TestCase):
     def test_every_way_to_say_one(self):
         self.assertEqual(
-            linkbot.references('see #160, issue 12, PR 305, pull request #7 and pull 8'), [160, 12, 305, 7, 8]
+            linkbot.references('see #160, issue #12, PR #305, pull request #7 and pull #8'), [160, 12, 305, 7, 8]
         )
 
     def test_each_once_and_at_most_five(self):
@@ -41,7 +41,10 @@ class References(unittest.TestCase):
         self.assertEqual(linkbot.references(text), [])
 
     def test_case(self):
-        self.assertEqual(linkbot.references('Issue 9 and pr 10'), [9, 10])
+        self.assertEqual(linkbot.references('Issue #9 and pr #10'), [9, 10])
+
+    def test_a_number_without_its_hash_is_talk(self):
+        self.assertEqual(linkbot.references('issue 12, PR 305, pull request 7, pull 8 and pr 2 broke'), [])
 
 
 class Reply(unittest.TestCase):
@@ -108,6 +111,88 @@ class Lookup(unittest.TestCase):
         self.assertFalse(asyncio.run(linkbot.answer('#999 only', self.github, send)))
         self.assertFalse(asyncio.run(linkbot.answer('nothing here', self.github, send)))
         self.assertEqual(len(sent), 1)
+
+
+NIGHTLY = {
+    'name': 'Nightly 2026-10-17 (44aa300)',
+    'tag_name': 'nightly-2026-10-17-44aa300',
+    'html_url': 'https://n/nightly-2026-10-17-44aa300',
+    'prerelease': False,
+    'assets': [
+        {'name': 'ScarletNX-windows-x86_64.zip', 'size': 80 * 1048576, 'browser_download_url': 'https://n/win'},
+        {'name': 'ScarletNX-linux-x86_64.AppImage', 'size': 50 * 1048576, 'browser_download_url': 'https://n/lin'},
+    ],
+}
+PR_BUILDS = dict(
+    NIGHTLY, name='PR #355: Android menu files', tag_name='pr-355', html_url='https://n/pr-355', prerelease=True
+)
+VERSION = dict(NIGHTLY, name='ScarletNX 0.1.0', tag_name='v0.1.0', html_url='https://x/v0.1.0')
+
+
+class Commands(unittest.TestCase):
+    def setUp(self):
+        self.asked, self.version = [], None
+
+        def fetch(url):
+            self.asked.append(url)
+            if url == 'https://api.github.com/repos/o/nightly/releases/latest':
+                return NIGHTLY
+            if url == 'https://api.github.com/repos/o/nightly/releases/tags/pr-355':
+                return PR_BUILDS
+            if url == 'https://api.github.com/repos/o/r/releases/latest':
+                return self.version
+            if url.endswith('/issues/355'):
+                return dict(PULL, number=355, html_url='https://x/pull/355')
+            return None
+
+        self.github = linkbot.GitHub('o/r', fetch=fetch, clock=lambda: 0.0)
+        self.sent = []
+
+    def say(self, text):
+        async def send(embed):
+            self.sent.append(embed)
+
+        return asyncio.run(linkbot.answer(text, self.github, send))
+
+    def test_nightly_links_the_newest_and_its_downloads(self):
+        self.assertTrue(self.say('!nightly'))
+        embed = self.sent[0]
+        self.assertEqual((embed['title'], embed['url']), (NIGHTLY['name'], NIGHTLY['html_url']))
+        self.assertIn('[ScarletNX-linux-x86_64.AppImage](https://n/lin) (50 MiB)', embed['description'])
+        self.assertLess(embed['description'].index('linux'), embed['description'].index('windows'))
+
+    def test_release_without_a_version_says_so_and_gives_the_nightly(self):
+        self.assertTrue(self.say('!release'))
+        self.assertTrue(self.sent[0]['description'].startswith('No version is released yet. The newest nightly:'))
+        self.assertEqual(self.sent[0]['url'], NIGHTLY['html_url'])
+
+    def test_release_gives_the_newest_version(self):
+        self.version = VERSION
+        self.assertTrue(self.say('  !Release '))
+        self.assertEqual(self.sent[0]['url'], VERSION['html_url'])
+        self.assertEqual(self.sent[0]['color'], linkbot.COLORS['open'])
+
+    def test_release_of_a_pull_request_gives_its_builds_and_no_link_besides(self):
+        self.assertTrue(self.say('!release #355'))
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual((self.sent[0]['url'], self.sent[0]['color']), (PR_BUILDS['html_url'], 0x6E7781))
+
+    def test_release_of_a_pull_request_without_builds_says_so(self):
+        self.assertTrue(self.say('!release #354'))
+        self.assertTrue(self.sent[0]['description'].startswith('No builds for #354'))
+
+    def test_only_a_message_of_its_own_is_a_command(self):
+        self.assertFalse(self.say('try !nightly later'))
+        self.assertFalse(self.say('!nightlies'))
+        self.assertEqual(self.sent, [])
+
+    def test_asked_once_while_remembered(self):
+        self.say('!nightly')
+        self.say('!nightly')
+        self.assertEqual(self.asked.count('https://api.github.com/repos/o/nightly/releases/latest'), 1)
+
+    def test_nightly_repository_can_be_named(self):
+        self.assertEqual(linkbot.GitHub('o/r', nightly='p/builds').nightly, 'p/builds')
 
 
 if __name__ == '__main__':

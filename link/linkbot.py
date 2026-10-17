@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""A Discord bot that links the issues and pull requests a message names.
+"""A Discord bot that links the issues and pull requests a message names, and the builds it is asked for.
 
-    LINKBOT_TOKEN=... LINKBOT_REPO=OWNER/NAME [LINKBOT_CHANNELS=id,id] [GITHUB_TOKEN=...] linkbot.py
+    LINKBOT_TOKEN=... LINKBOT_REPO=OWNER/NAME [LINKBOT_NIGHTLY=OWNER/NAME] [LINKBOT_CHANNELS=id,id] [GITHUB_TOKEN=...]
+    linkbot.py
 
-A message that says #160, issue 160, PR 160 or pull request 160 gets one reply: each of them linked, with its
-title, whether it is an issue or a pull request, its state and its labels, in GitHub's colours. A number GitHub
-does not know is left out; one inside code or a link is not a reference. At most MOST of them a message.
+A message that names #160 (issue #160 and PR #160 too; a number without its # is not a reference) gets one reply:
+each of them linked, with its title, whether it is an issue or a pull request, its state and its labels, in GitHub's
+colours. A number GitHub does not know is left out; one inside code or a link is not a reference. At most MOST of
+them a message.
+
+Commands, each a message of its own: !nightly links the newest nightly and its downloads; !release the newest
+version, or the newest nightly while there is none; !release #355 pull request 355's builds. The nightlies and a pull
+request's builds are releases of LINKBOT_NIGHTLY (OWNER/nightly by default), as ScarletNX's publish workflow makes them.
 
 What it reads: the text of messages in the channels it is in (LINKBOT_CHANNELS narrows them), only to find those
 references. It keeps nothing: no message, no author, no log of what was said. It asks GitHub for the numbers it
@@ -22,12 +28,11 @@ import time
 import urllib.error
 import urllib.request
 
-MOST, CACHE = 5, 600
-# #160, issue 160, issue #160, PR 160, pull request 160, pull 160; not inside a word, a path or a link
-REFERENCE = re.compile(
-    r'(?<![\w/#&])#(\d{1,6})\b|\b(?:issue|pr|pull request|pull)\s*#?(\d{1,6})\b',
-    re.IGNORECASE,
-)
+MOST, CACHE, FILES = 5, 600, 12
+# #160, as in issue #160 or PR #160; not inside a word, a path or a link. A bare 160 is not one: "pr 2 broke" is talk
+REFERENCE = re.compile(r'(?<![\w/#&])#(\d{1,6})\b')
+# the whole message: !nightly, !release, or !release #N
+COMMAND = re.compile(r'\s*!(?:(nightly)|release(?:\s+#(\d{1,6}))?)\s*', re.IGNORECASE)
 # what is not prose: code, and links
 CODE = re.compile(r'```.*?```|`[^`\n]*`', re.DOTALL)
 LINK = re.compile(r'<?https?://\S+>?')
@@ -49,7 +54,7 @@ def references(text):
     prose = LINK.sub(' ', CODE.sub(' ', text or ''))
     found = []
     for match in REFERENCE.finditer(prose):
-        number = int(match.group(1) or match.group(2))
+        number = int(match.group(1))
         if number and number not in found:
             found.append(number)
     return found[:MOST]
@@ -103,11 +108,35 @@ def reply(items):
     return {'description': description, 'color': color}
 
 
-class GitHub:
-    """issues and pull requests by number, through GitHub's REST API, remembered CACHE seconds"""
+def size(count):
+    return f'{count / 1048576:.0f} MiB' if count >= 1048576 else f'{max(count, 1) / 1024:.0f} KiB'
 
-    def __init__(self, repo, token='', fetch=None, clock=time.monotonic):
+
+def build(release, said=''):
+    """a release as the reply says it: its name linked, then each download and its size; a version green"""
+    files = sorted(release.get('assets', []), key=lambda asset: asset['name'])
+    lines = [f'[{a["name"]}]({a["browser_download_url"]}) ({size(a["size"])})' for a in files[:FILES]]
+    if len(files) > FILES:
+        lines.append(f'and {len(files) - FILES} more on its page')
+    description = '\n'.join(([said] if said else []) + (lines or ['No downloads on it yet.']))
+    return {
+        'title': (release.get('name') or release['tag_name'])[:256],
+        'url': release['html_url'],
+        'description': description[:4096],
+        'color': 0x6E7781 if release.get('prerelease') else COLORS['open'],
+    }
+
+
+def note(text):
+    return {'description': text, 'color': 0x6E7781}
+
+
+class GitHub:
+    """issues and pull requests by number, and releases, through GitHub's REST API, remembered CACHE seconds"""
+
+    def __init__(self, repo, token='', fetch=None, clock=time.monotonic, nightly=''):
         self.repo, self.token, self.clock = repo, token, clock
+        self.nightly = nightly or repo.split('/')[0] + '/nightly'
         self.fetch = fetch or self.http
         self.cache = {}
 
@@ -136,9 +165,52 @@ class GitHub:
         self.cache[number] = (now, found)
         return found
 
+    def release(self, repo, which):
+        """a release of repo, 'latest' or 'tags/<tag>', or None when there is none"""
+        url = f'https://api.github.com/repos/{repo}/releases/{which}'
+        now = self.clock()
+        if url in self.cache and now - self.cache[url][0] < CACHE:
+            return self.cache[url][1]
+        found = self.fetch(url)
+        self.cache[url] = (now, found)
+        return found
+
+
+async def command(message_text, github, send):
+    """a command's reply, sent through send(embed dict); whether the message was a command"""
+    match = COMMAND.fullmatch(message_text or '')
+    if not match:
+        return False
+    loop = asyncio.get_running_loop()
+
+    async def ask(repo, which):
+        return await loop.run_in_executor(None, github.release, repo, which)
+
+    if match.group(1):
+        found = await ask(github.nightly, 'latest')
+        await send(build(found) if found else note('No nightly is published yet.'))
+    elif match.group(2):
+        number = int(match.group(2))
+        found = await ask(github.nightly, f'tags/pr-{number}')
+        missing = f'No builds for #{number}: a pull request has them while it is open and its last push built.'
+        await send(build(found) if found else note(missing))
+    else:
+        found = await ask(github.repo, 'latest')
+        newest = None if found else await ask(github.nightly, 'latest')
+        if found:
+            await send(build(found))
+        elif newest:
+            await send(build(newest, 'No version is released yet. The newest nightly:'))
+        else:
+            await send(note('No version and no nightly are published yet.'))
+    return True
+
 
 async def answer(message_text, github, send):
-    """the reply to a message: the items it names, sent through send(embed dict); whether one was sent"""
+    """the reply to a message: a command's, else the items it names, sent through send(embed dict); whether one was
+    sent"""
+    if await command(message_text, github, send):
+        return True
     numbers = references(message_text)
     if not numbers:
         return False
@@ -157,7 +229,10 @@ def main():
     if not token or not re.fullmatch(r'[\w.-]+/[\w.-]+', repo):
         sys.exit('linkbot: LINKBOT_TOKEN and LINKBOT_REPO (OWNER/NAME) are needed')
     channels = {int(c) for c in os.environ.get('LINKBOT_CHANNELS', '').split(',') if c.strip()}
-    github = GitHub(repo, os.environ.get('GITHUB_TOKEN', ''))
+    nightly = os.environ.get('LINKBOT_NIGHTLY', '')
+    if nightly and not re.fullmatch(r'[\w.-]+/[\w.-]+', nightly):
+        sys.exit('linkbot: LINKBOT_NIGHTLY is OWNER/NAME')
+    github = GitHub(repo, os.environ.get('GITHUB_TOKEN', ''), nightly=nightly)
     intents = discord.Intents.none()
     intents.guilds = intents.guild_messages = intents.message_content = True
     client = discord.Client(intents=intents, allowed_mentions=discord.AllowedMentions.none())
