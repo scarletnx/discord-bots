@@ -52,6 +52,20 @@ static const struct {
 #define NCHECKS (int)(sizeof CHECKS / sizeof *CHECKS)
 
 static const char* S(const char* s) { return s ? s : ""; }
+/* FNV-1a of text, as 16 hex digits */
+static void fnv(const char* text, char out[17]) {
+    unsigned long long h = 1469598103934665603ULL;
+    const unsigned char* p;
+    for (p = (const unsigned char*)text; *p; ++p) h = (h ^ *p) * 1099511628211ULL;
+    snprintf(out, 17, "%016llx", h);
+}
+/* what moves a card to the end of its channel, hashed into c->activity */
+static void activity(Cards* c, const char* state, const cJSON* comment, const char* builds, const char* head) {
+    char* text =
+        rei_format("%s|%s|%s|%s|%s", state, S(jstr(comment, "html_url")), S(jstr(comment, "created_at")), builds, head);
+    fnv(text, c->activity);
+    free(text);
+}
 
 /* ---- time: GitHub's ISO 8601 (2026-10-20T18:30:00Z) and back ---- */
 static long long days_from_civil(int y, int m, int d) { /* Howard Hinnant's, for the proleptic Gregorian calendar */
@@ -487,6 +501,19 @@ cJSON* cd_pr(Cards* c, int number, int* open, double* closed_at) {
         built = rei_strdup(strcmp(fork_name, c->gh->repo) && !labeled(pr, LABEL) ? "waits for the team's label"
                                                                                  : "being published");
         packages(fields, jobs, current, built);
+        /* the outcome that moves the card: published or failed, kept while its push's builds run again or are
+           cancelled */
+        if (current)
+            snprintf(c->builds, sizeof c->builds, "published %s", head);
+        else if (run && !strcmp(S(jstr(run, "status")), "completed") &&
+                 (!strcmp(S(jstr(run, "conclusion")), "failure") || !strcmp(S(jstr(run, "conclusion")), "timed_out") ||
+                  !strcmp(S(jstr(run, "conclusion")), "startup_failure")))
+            snprintf(c->builds, sizeof c->builds, "failed %s", head);
+        else {
+            char* mine = rei_format(" %s", head);
+            if (!suffix(c->builds, mine)) c->builds[0] = 0; /* another push's */
+            free(mine);
+        }
         if (!run)
             buf_add(&v, "Not started");
         else if (strcmp(S(jstr(run, "status")), "completed"))
@@ -532,6 +559,12 @@ cJSON* cd_pr(Cards* c, int number, int* open, double* closed_at) {
     title = rei_format("PR #%d: %s", number, S(jstr(pr, "title")));
     e = embed(c, title, S(jstr(pr, "html_url")), buf_take(&b), fields, color, "Edited at each push, comment and build",
               author_of(cJSON_GetObjectItemCaseSensitive(pr, "user")));
+    activity(c,
+             jbool(pr, "merged")        ? "merged"
+             : !strcmp(state, "closed") ? "closed"
+             : draft                    ? "draft"
+                                        : "open",
+             comment, c->builds, head);
     for (i = 0; i < n; ++i) free(subjects[i]);
     free(subjects);
     free(title);
@@ -591,6 +624,11 @@ cJSON* cd_issue(Cards* c, int number, int* open, double* closed_at) {
     title = rei_format("#%d: %s", number, S(jstr(issue, "title")));
     e = embed(c, title, S(jstr(issue, "html_url")), buf_take(&b), cJSON_CreateArray(), color, footer_text,
               author_of(cJSON_GetObjectItemCaseSensitive(issue, "user")));
+    {
+        char* state = rei_format("%s %s", S(jstr(issue, "state")), S(reason));
+        activity(c, state, comment, "", "");
+        free(state);
+    }
     free(title);
     free(footer_text);
     free(quoted);
@@ -723,6 +761,7 @@ cJSON* cd_nightly(Cards* c, const char* sha) {
     char** lines;
     Buf b = {0};
     c->failed = 0;
+    c->activity[0] = 0;
     head = get(c, "repos/%s/commits/%s", c->gh->repo, sha);
     snprintf(date, sizeof date, "%s", S(jstr(jpath(head, "commit.committer"), "date")));
     snprintf(tail, sizeof tail, "-%.7s", sha);
@@ -812,12 +851,9 @@ cJSON* cd_nightly(Cards* c, const char* sha) {
 void cd_hash(const cJSON* embed, char out[17]) {
     cJSON* shown = cJSON_Duplicate(embed, 1);
     char* text;
-    unsigned long long h = 1469598103934665603ULL;
-    const unsigned char* p;
     cJSON_DeleteItemFromObjectCaseSensitive(shown, "timestamp");
     text = cJSON_PrintUnformatted(shown);
-    for (p = (const unsigned char*)text; *p; ++p) h = (h ^ *p) * 1099511628211ULL;
-    snprintf(out, 17, "%016llx", h);
+    fnv(text, out);
     free(text);
     cJSON_Delete(shown);
 }
@@ -1090,6 +1126,17 @@ static void mark_head(Cards* c) {
     cJSON_Delete(got);
 }
 
+/* a card's message from before its move deleted: 1 when it is gone */
+static int unstale(Cards* c, CdCard* card, u64 channel) {
+    int said = c->dc.remove(c->dc.ctx, channel, card->stale);
+    if (said && said != 404) {
+        rei_log("%s: message %llu, the one before its move, not deleted: Discord answered %d: tried again next round",
+                card->key, (unsigned long long)card->stale, said);
+        return 0;
+    }
+    card->stale = 0;
+    return 1;
+}
 /* each card to draw, posted, edited, or left as it is */
 static void draw(Cards* c, CdCard* card, double now) {
     u64 channel = channel_of(c, card->key);
@@ -1101,9 +1148,11 @@ static void draw(Cards* c, CdCard* card, double now) {
         card->dirty = 0;
         return;
     }
-    if (prefix(card->key, "pr-"))
+    if (prefix(card->key, "pr-")) {
+        snprintf(c->builds, sizeof c->builds, "%s", card->builds);
         e = cd_pr(c, atoi(card->key + 3), &open, &closed_at);
-    else if (prefix(card->key, "issue-"))
+        if (e) snprintf(card->builds, sizeof card->builds, "%s", c->builds);
+    } else if (prefix(card->key, "issue-"))
         e = cd_issue(c, atoi(card->key + 6), &open, &closed_at);
     else
         e = cd_nightly(c, card->key + 8);
@@ -1117,6 +1166,26 @@ static void draw(Cards* c, CdCard* card, double now) {
     } else if (!card->closed)
         card->closed = closed_at ? closed_at : now;
     cd_hash(e, hash);
+    if (card->stale && !unstale(c, card, channel)) {
+        cJSON_Delete(e);
+        return;
+    }
+    if (!*card->moved) /* seen first: what moves it from now on */
+        snprintf(card->moved, sizeof card->moved, "%s", c->activity);
+    if (card->message && strcmp(c->activity, card->moved)) {
+        /* to the end of its channel: the new one posted before the old one is deleted, so it is never missing */
+        u64 id = c->dc.post(c->dc.ctx, channel, e);
+        if (!id) {
+            rei_log("%s: not moved to the end, not posted: tried again next round", card->key);
+            cJSON_Delete(e);
+            return;
+        }
+        card->stale = card->message;
+        card->message = id;
+        snprintf(card->moved, sizeof card->moved, "%s", c->activity);
+        snprintf(card->drawn, sizeof card->drawn, "%s", hash);
+        unstale(c, card, channel);
+    }
     if (card->message && strcmp(hash, card->drawn)) {
         said = c->dc.edit(c->dc.ctx, channel, card->message, e);
         if (said == 404) /* deleted on Discord: a new one, while it may have one */
@@ -1136,6 +1205,7 @@ static void draw(Cards* c, CdCard* card, double now) {
             return;
         }
         card->message = id;
+        snprintf(card->moved, sizeof card->moved, "%s", c->activity);
     }
     snprintf(card->drawn, sizeof card->drawn, "%s", hash);
     card->dirty = 0;
@@ -1146,6 +1216,7 @@ static void sweep(Cards* c, double now) {
     int i, nightly = 0;
     for (i = 0; i < c->ncards; ++i) {
         CdCard* card = &c->cards[i];
+        if (card->stale && !card->dirty) unstale(c, card, channel_of(c, card->key)); /* a dirty one: by its draw */
         if (card->closed && card->message && now - card->closed >= CD_DAY) {
             int said = c->dc.remove(c->dc.ctx, channel_of(c, card->key), card->message);
             if (!said || said == 404) {
@@ -1192,6 +1263,10 @@ cJSON* cd_save(const Cards* c) {
         cJSON_AddStringToObject(one, "key", k->key);
         cJSON_AddStringToObject(one, "message", id);
         cJSON_AddStringToObject(one, "drawn", k->drawn);
+        cJSON_AddStringToObject(one, "moved", k->moved);
+        cJSON_AddStringToObject(one, "builds", k->builds);
+        snprintf(id, sizeof id, "%llu", (unsigned long long)k->stale);
+        cJSON_AddStringToObject(one, "stale", id);
         cJSON_AddNumberToObject(one, "closed", k->closed);
         cJSON_AddBoolToObject(one, "gone", k->gone);
         cJSON_AddBoolToObject(one, "dirty", k->dirty);
@@ -1225,9 +1300,13 @@ void cd_load(Cards* c, const cJSON* saved) {
         k = card_of(c, jstr(one, "key"), 1);
         k->message = strtoull(S(jstr(one, "message")), NULL, 10);
         snprintf(k->drawn, sizeof k->drawn, "%s", S(jstr(one, "drawn")));
+        snprintf(k->moved, sizeof k->moved, "%s", S(jstr(one, "moved")));
+        snprintf(k->builds, sizeof k->builds, "%s", S(jstr(one, "builds")));
+        k->stale = strtoull(S(jstr(one, "stale")), NULL, 10);
         k->closed = jnum(one, "closed");
         k->gone = jbool(one, "gone");
-        k->dirty = jbool(one, "dirty");
+        /* a card kept before its activity was: drawn again once, to learn it, so its next activity moves it */
+        k->dirty = jbool(one, "dirty") || (k->message && !*k->moved && !prefix(k->key, "nightly-"));
     }
     cJSON_ArrayForEach(one, cJSON_GetObjectItemCaseSensitive(saved, "runs")) {
         if (c->nruns == CD_RUNS || !jstr(one, "id")) continue;
