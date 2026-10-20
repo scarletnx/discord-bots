@@ -17,7 +17,7 @@ load_rc_config $name
 
 pidfile=/var/run/${name}.pid
 command=/usr/sbin/daemon
-command_args="-r -R 30 -S -T ${name} -u ${name} -P ${pidfile} /usr/local/bin/python3.12 /usr/local/libexec/${name}.py"
+command_args="-f -r -R 30 -S -T ${name} -u ${name} -P ${pidfile} /usr/local/bin/python3.12 /usr/local/libexec/${name}.py"
 start_precmd="${name}_precmd"
 
 xuji_precmd()

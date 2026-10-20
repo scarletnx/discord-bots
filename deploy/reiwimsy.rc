@@ -19,7 +19,7 @@ load_rc_config $name
 
 pidfile=/var/run/${name}.pid
 command=/usr/sbin/daemon
-command_args="-r -R 30 -S -T ${name} -u ${name} -P ${pidfile} /usr/local/libexec/${name}"
+command_args="-f -r -R 30 -S -T ${name} -u ${name} -P ${pidfile} /usr/local/libexec/${name}"
 start_precmd="${name}_precmd"
 
 reiwimsy_precmd()
