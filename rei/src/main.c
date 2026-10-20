@@ -233,6 +233,7 @@ static void on_message(struct discord* client, const struct discord_message* m) 
 
 int main(void) {
     struct discord* client;
+    struct discord_config config;
     CdDiscord cdd;
     cJSON* saved;
     CCORDcode code;
@@ -256,7 +257,10 @@ int main(void) {
     cd_load(&cards, cJSON_GetObjectItemCaseSensitive(saved, "cards"));
     cards_saved = cd_save(&cards);
     cJSON_Delete(saved);
-    client = discord_from_token(env.token);
+    memset(&config, 0, sizeof config);
+    config.token = (char*)env.token;
+    config.log.level = LOGMOD_LEVEL_WARN; /* Concord's traces name every event: only what goes wrong is logged */
+    client = discord_from_config(&config);
     if (!client) stop("Concord could not start a client with REIWIMSY_TOKEN%s", "");
     discord_add_intents(client,
                         DISCORD_GATEWAY_GUILDS | DISCORD_GATEWAY_GUILD_MESSAGES | DISCORD_GATEWAY_MESSAGE_CONTENT);
