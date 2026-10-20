@@ -6,7 +6,7 @@ the jail with [Concord](https://github.com/Cogmasters/concord) v3.0.1, libcurl a
 
 | Bot | What it does | What it reads | What it sends out |
 |---|---|---|---|
-| `rei/` (ReiWimsy) | A message that names `#160` (`issue #160`, `PR #160` too; a bare number is talk) gets one reply: each linked, with its title, issue or PR, its state and labels, in GitHub's colours. `!nightly` links the newest nightly and its downloads, `!release` the newest version (the nightly while there is none), `!release #355` a pull request's builds. With a GitHub token it edits a reply of the last week when what it links changes. The cards: a message for each open pull request, each open issue and each push to main, in channels of their own, drawn from what GitHub says now and edited as it changes (its state, its commits or changes, the latest comment a person wrote, each package of its build); a pull request or an issue closed keeps its card a day, as it closed, then the card is deleted | the text of messages, only to find those; GitHub's API, every 30 s, for what changed | the numbers, to GitHub's API |
+| `rei/` (ReiWimsy) | A message that names `#160` (`issue #160`, `PR #160` too; a bare number is talk) gets one reply: each linked, with its title, issue or PR, its state and labels, in GitHub's colours. `!nightly` links the newest nightly and its downloads, `!release` the newest version (the nightly while there is none), `!release #355` a pull request's builds. With a GitHub token it edits a reply of the last week when what it links changes. The cards: a message for each open pull request, each open issue and each push to main, in channels of their own, drawn from what GitHub says now and edited as it changes (its state, its commits or changes, the latest comment a person wrote, each package of its build); its activity (a push, a person's comment, a change of state, a pull request's builds published or failed) moves it to the end of its channel, posted again before the old one is deleted; a pull request or an issue closed keeps its card a day, as it closed, then the card is deleted | the text of messages, only to find those; GitHub's API, every 30 s, for what changed | the numbers, to GitHub's API |
 | `xuji/xuji.py` | Grok 4.7 (XG47, codename Xuji) for its owner alone: a reply to a message mentioning @Xuji answers about the message quoted; `@Xuji handback #channel FROM [TO] [notes]` writes a handback for Aogo as a Markdown file. In a channel or in its DMs | the quoted message, or a channel's messages of those days | to xAI: the texts, scrubbed (no names or ids, people as user1, user2..., mentions, e-mails and phones out, files by name only) |
 
 Anyone else mentioning Xuji gets nothing and costs nothing. Neither bot keeps a message or logs what was said, and
@@ -47,7 +47,7 @@ while the `REIWIMSY_` ones are unset, the log saying so. It keeps GitHub's answe
 
 No network and no Discord: the parsing, the gateway's events (read from their JSON: Concord decodes none of them, as
 its decoder crashed on messages of 2 to 3 KB) and the messages waiting for an answer, the replies and their edits,
-GitHub's ETags and pages, Discord's waits and answers, the cards (drawn, posted, edited, deleted a day after they close, reposted when deleted by hand), the state
+GitHub's ETags and pages, Discord's waits and answers, the cards (drawn, posted, edited, moved to the end at their activity, deleted a day after they close, reposted when deleted by hand), the state
 file; Xuji's privacy scrub, transcript and prompts.
 
 ## Deploy (on the jail's host, as root)

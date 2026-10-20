@@ -446,7 +446,7 @@ typedef struct {
     int removed;
 } Sent;
 static Sent sent[256];
-static int nsent, cd_edits, cd_removes, edit_gone;
+static int nsent, cd_edits, cd_removes, edit_gone, remove_fails;
 static u64 next_id = 1000;
 static u64 c_post(void* ctx, u64 channel, const cJSON* embed) {
     (void)ctx;
@@ -476,6 +476,7 @@ static int c_remove(void* ctx, u64 channel, u64 message) {
     (void)ctx;
     (void)channel;
     ++cd_removes;
+    if (remove_fails) return remove_fails; /* Discord's status */
     if (s) s->removed = 1;
     return 0;
 }
@@ -493,13 +494,14 @@ static int c_history(void* ctx, u64 channel, u64 before, u64* ids, int* webhook,
     mine[1] = 0;
     return 2;
 }
+static const char* issue_label = "kind: bug";
 static void cards_fixtures(const char* issue_state, const char* closed_at) {
     char* issue = rei_format(
         "{\"number\":12,\"title\":\"Crash on start\",\"html_url\":\"https://github.com/o/r/issues/12\",\"state\":\"%s\","
         "\"state_reason\":%s,\"closed_at\":%s,\"comments\":1,\"body\":\"It crashes <!-- x -->here.\","
-        "\"labels\":[{\"name\":\"kind: bug\",\"color\":\"d73a4a\"}],\"assignees\":[],\"user\":{\"login\":\"ana\","
+        "\"labels\":[{\"name\":\"%s\",\"color\":\"d73a4a\"}],\"assignees\":[],\"user\":{\"login\":\"ana\","
         "\"html_url\":\"https://github.com/ana\"},\"type\":{\"name\":\"Bug\"}}",
-        issue_state, strcmp(issue_state, "open") ? "\"completed\"" : "null", closed_at);
+        issue_state, strcmp(issue_state, "open") ? "\"completed\"" : "null", closed_at, issue_label);
     char* listing = rei_format("[%s]", issue);
     gh("repos/o/r/issues/12", issue);
     gh("repos/o/r/issues/12/comments?per_page=100&page=1",
@@ -515,6 +517,27 @@ static void cards_fixtures(const char* issue_state, const char* closed_at) {
     gh("repos/o/nightly/releases?per_page=100&page=1", "[]");
     gh("repos/o/r/actions/workflows/build.yml/runs?per_page=20", "{\"workflow_runs\":[]}");
     gh("repos/o/r/commits/main", "{\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}");
+}
+#define COMMENTS_DAN                                                                                                   \
+    "[{\"user\":{\"login\":\"bia\",\"type\":\"User\"},\"body\":\"Same\",\"html_url\":\"https://c/1\","                 \
+    "\"created_at\":\"2026-10-20T09:00:00Z\"},{\"user\":{\"login\":\"dan\",\"type\":\"User\"},\"body\":\"Mine too\","  \
+    "\"html_url\":\"https://c/5\",\"created_at\":\"2026-10-20T11:00:00Z\"}]"
+/* the issue's comments: one by who, at when */
+static void comment_by(const char* who, const char* when) {
+    char* list = rei_format("[{\"user\":{\"login\":\"%s\",\"type\":\"User\"},\"body\":\"hi\",\"html_url\":"
+                            "\"https://c/%s\",\"created_at\":\"%s\"}]",
+                            who, who, when);
+    gh("repos/o/r/issues/12/comments?per_page=100&page=1", list);
+    free(list);
+}
+/* a round 30 s on, GitHub listing these issues as updated since the last */
+static void updated(Cards* c, const char* listed) {
+    char* listing =
+        rei_format("repos/o/r/issues?state=all&sort=updated&direction=desc&since=%s&per_page=100&page=1", c->since);
+    gh(listing, listed);
+    free(listing);
+    now_is += 30;
+    cd_round(c);
 }
 static void cards_tests(void) {
     Cards c;
@@ -555,23 +578,29 @@ static void cards_tests(void) {
     now_is += 30;
     cd_round(&c);
     CHECK(nsent == 1 && cd_edits == 0 && !c.cards[0].dirty);
-    /* closed: the card edited as it closed, deleted a day after */
+    /* a label changed: edited where it is */
+    issue_label = "kind: crash";
+    cards_fixtures("open", "null");
+    updated(&c, "[{\"number\":12}]");
+    CHECK(nsent == 1 && cd_edits == 1 && !sent[0].removed);
+    HAS(sent[0].description, "`kind: crash`");
+    /* a person's comment: to the end of the channel, the new card posted before the old one is deleted */
+    gh("repos/o/r/issues/12/comments?per_page=100&page=1", COMMENTS_DAN);
+    updated(&c, "[{\"number\":12}]");
+    CHECK(nsent == 2 && sent[0].removed && !sent[1].removed && c.cards[0].message == sent[1].message);
+    CHECK(cd_edits == 1 && cd_removes == 2 && !c.cards[0].stale);
+    HAS(sent[1].description, "by **dan**");
+    HAS(sent[1].description, "`kind: crash`");
+    /* closed: to the end as it closed, deleted a day after */
+    issue_label = "kind: bug";
     cards_fixtures("closed", "\"2025-10-20T10:01:00Z\"");
-    listing =
-        rei_format("repos/o/r/issues?state=all&sort=updated&direction=desc&since=%s&per_page=100&page=1", c.since);
-    gh(listing, "[{\"number\":12}]");
-    free(listing);
-    now_is += 30;
-    cd_round(&c);
-    CHECK(cd_edits == 1 && !sent[0].removed);
-    HAS(sent[0].description, "**Closed** as done");
+    gh("repos/o/r/issues/12/comments?per_page=100&page=1", COMMENTS_DAN);
+    updated(&c, "[{\"number\":12}]");
+    CHECK(nsent == 3 && sent[1].removed && !sent[2].removed && cd_edits == 1 && cd_removes == 3);
+    HAS(sent[2].description, "**Closed** as done");
     now_is = 1760954460 + CD_DAY;
-    listing =
-        rei_format("repos/o/r/issues?state=all&sort=updated&direction=desc&since=%s&per_page=100&page=1", c.since);
-    gh(listing, "[]");
-    free(listing);
-    cd_round(&c);
-    CHECK(sent[0].removed && cd_removes == 2);
+    updated(&c, "[]");
+    CHECK(sent[2].removed && cd_removes == 4);
     {
         cJSON* saved = cd_save(&c);
         char* text = cJSON_PrintUnformatted(saved);
@@ -580,29 +609,52 @@ static void cards_tests(void) {
         free(text);
         cJSON_Delete(saved);
     }
-    /* reopened: a card again */
+    /* reopened: a card again, at the end; the next round leaves it */
     cards_fixtures("open", "null");
-    listing =
-        rei_format("repos/o/r/issues?state=all&sort=updated&direction=desc&since=%s&per_page=100&page=1", c.since);
-    gh(listing, "[{\"number\":12}]");
-    free(listing);
-    now_is += 30;
-    cd_round(&c);
-    CHECK(nsent == 2 && sent[1].channel == 1 && !sent[1].removed && !c.cards[0].gone && !c.cards[0].closed);
+    gh("repos/o/r/issues/12/comments?per_page=100&page=1", COMMENTS_DAN);
+    updated(&c, "[{\"number\":12}]");
+    CHECK(nsent == 4 && sent[3].channel == 1 && !sent[3].removed && !c.cards[0].gone && !c.cards[0].closed);
+    updated(&c, "[{\"number\":12}]");
+    CHECK(nsent == 4 && cd_edits == 1 && cd_removes == 4);
     /* a card deleted by hand on Discord: posted again at its next change */
     edit_gone = 1;
+    issue_label = "kind: crash";
+    cards_fixtures("open", "null");
+    gh("repos/o/r/issues/12/comments?per_page=100&page=1", COMMENTS_DAN);
+    updated(&c, "[{\"number\":12}]");
+    edit_gone = 0;
+    CHECK(nsent == 5 && c.cards[0].message == sent[4].message);
+    HAS(sent[4].description, "`kind: crash`");
     gh("repos/o/r/issues/12/comments?per_page=100&page=1",
        "[{\"user\":{\"login\":\"cid\",\"type\":\"User\"},\"body\":\"newer\",\"html_url\":\"https://c/2\","
        "\"created_at\":\"2026-10-21T09:00:00Z\"}]");
-    listing =
-        rei_format("repos/o/r/issues?state=all&sort=updated&direction=desc&since=%s&per_page=100&page=1", c.since);
-    gh(listing, "[{\"number\":12}]");
-    free(listing);
-    now_is += 30;
-    cd_round(&c);
-    edit_gone = 0;
-    CHECK(nsent == 3);
-    HAS(sent[2].description, "by **cid**");
+    updated(&c, "[{\"number\":12}]");
+    CHECK(nsent == 6 && sent[4].removed);
+    HAS(sent[5].description, "by **cid**");
+    /* the old card not deleted at a move: kept as stale, deleted by a later round, even with nothing new */
+    remove_fails = 500;
+    comment_by("eve", "2026-10-22T09:00:00Z");
+    updated(&c, "[{\"number\":12}]");
+    CHECK(nsent == 7 && c.cards[0].message == sent[6].message && c.cards[0].stale == sent[5].message);
+    CHECK(!sent[5].removed && !c.cards[0].dirty);
+    updated(&c, "[]");
+    CHECK(c.cards[0].stale == sent[5].message);
+    remove_fails = 0;
+    updated(&c, "[]");
+    CHECK(sent[5].removed && !c.cards[0].stale && nsent == 7);
+    /* no move while one stays: the activity waits, the card dirty, until the old one is gone (404: deleted by hand) */
+    remove_fails = 500;
+    comment_by("fay", "2026-10-23T09:00:00Z");
+    updated(&c, "[{\"number\":12}]");
+    CHECK(nsent == 8 && c.cards[0].stale == sent[6].message);
+    comment_by("gus", "2026-10-24T09:00:00Z");
+    updated(&c, "[{\"number\":12}]");
+    CHECK(nsent == 8 && c.cards[0].dirty && c.cards[0].stale == sent[6].message);
+    remove_fails = 404;
+    updated(&c, "[]");
+    remove_fails = 0;
+    CHECK(!c.cards[0].stale && nsent == 9 && c.cards[0].message == sent[8].message && !c.cards[0].dirty);
+    HAS(sent[8].description, "by **gus**");
     /* GitHub not answering: the card left as it was drawn, and drawn at the next round */
     {
         int before = nsent, edits_before = cd_edits;
@@ -631,14 +683,57 @@ static void cards_tests(void) {
         CHECK(again.ncards == 1 && again.cards[0].message == c.cards[0].message && again.purged_issues);
         SAME(again.since, c.since);
         SAME(again.head, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        SAME(again.cards[0].moved, c.cards[0].moved);
+        CHECK(*again.cards[0].moved && again.cards[0].stale == c.cards[0].stale);
         cd_free(&again);
         cJSON_Delete(saved);
+    }
+    /* cards kept before their activity was: an issue's drawn again once, where it is, to learn what moves it; a
+       nightly's never moves */
+    {
+        int before = nsent, removes = cd_removes;
+        char* old = rei_format("{\"cards\":[{\"key\":\"issue-12\",\"message\":\"%llu\",\"drawn\":\"x\",\"closed\":0,"
+                               "\"gone\":false,\"dirty\":false},{\"key\":\"nightly-abc\",\"message\":\"5\",\"drawn\":"
+                               "\"y\",\"closed\":0,\"gone\":false,\"dirty\":false}],\"since\":\"%s\",\"head\":\"%s\","
+                               "\"purged_issues\":true}",
+                               (unsigned long long)c.cards[0].message, c.since, c.head);
+        cJSON* saved = cJSON_Parse(old);
+        Cards again;
+        cd_init(&again, &g, dc, 0, 1, 3);
+        cd_load(&again, saved);
+        CHECK(again.ncards == 2 && again.cards[0].dirty && !*again.cards[0].moved && !again.cards[1].dirty);
+        cards_fixtures("open", "null");
+        updated(&again, "[]");
+        CHECK(nsent == before && cd_removes == removes && again.cards[0].message == c.cards[0].message);
+        CHECK(*again.cards[0].moved && !again.cards[0].dirty);
+        cd_free(&again);
+        cJSON_Delete(saved);
+        free(old);
     }
     cd_free(&c);
     rg_free(&g);
     forget();
 }
 
+/* pull request 7 drawn, as a round draws it: its releases asked again */
+static void drawn_pr(Cards* c) {
+    int open;
+    double closed;
+    cJSON_Delete(c->nightlies);
+    c->nightlies = NULL;
+    cJSON_Delete(cd_pr(c, 7, &open, &closed));
+}
+/* its push's Build run in that status, then drawn */
+static void run_is(Cards* c, const char* status) {
+    char* runs = rei_format("{\"workflow_runs\":[{\"id\":9,\"event\":\"pull_request\",\"status\":%s,\"html_url\":"
+                            "\"https://r/9\",\"created_at\":\"2026-10-20T11:00:00Z\"}]}",
+                            status);
+    gh("repos/o/r/actions/workflows/build.yml/runs?head_sha=1111111111111111111111111111111111111111&per_page=100&"
+       "page=1",
+       runs);
+    free(runs);
+    drawn_pr(c);
+}
 /* a pull request's card: its state, its commits, its builds */
 static void pr_card(void) {
     Cards c;
@@ -707,6 +802,166 @@ static void pr_card(void) {
     HAS(text, "\"color\":2066493"); /* GitHub's green: open */
     free(text);
     cJSON_Delete(e);
+    /* what moves it to the end: its push's builds published or failed (not a job's progress, a run again or
+       cancelled), a comment, a draft, a push; not a label */
+    {
+        char was[17];
+        const char* pr7 =
+            "{\"number\":7,\"title\":\"Faster [blit]\",\"html_url\":\"https://github.com/o/r/pull/7\",\"state\":\"open\","
+            "\"draft\":%s,\"merged\":false,\"comments\":%d,\"review_comments\":0,\"labels\":[%s],\"assignees\":[],"
+            "\"user\":{\"login\":\"ana\",\"html_url\":\"https://github.com/ana\",\"avatar_url\":\"https://a/1\"},"
+            "\"head\":{\"sha\":\"%s\",\"repo\":{\"full_name\":\"o/r\"}},\"base\":{\"sha\":"
+            "\"2222222222222222222222222222222222222222\"}}";
+        char* json;
+        /* the push before's builds, this one's running */
+        gh("repos/o/nightly/releases?per_page=100&page=1",
+           "[{\"tag_name\":\"pr-7\",\"html_url\":\"https://n/pr-7\",\"published_at\":\"2026-10-20T11:00:00Z\","
+           "\"body\":\"built from /commits/0000000000000000000000000000000000000000\",\"assets\":[]}]");
+        c.builds[0] = 0;
+        drawn_pr(&c);
+        snprintf(was, sizeof was, "%s", c.activity);
+        CHECK(*was && !*c.builds);
+        gh("repos/o/r/actions/runs/9/jobs?per_page=100&page=1",
+           "{\"jobs\":[{\"name\":\"Linux AppImage (x86_64)\",\"status\":\"completed\",\"conclusion\":\"success\"}]}");
+        drawn_pr(&c);
+        SAME(c.activity, was); /* a job done */
+        run_is(&c, "\"completed\",\"conclusion\":\"cancelled\"");
+        SAME(c.activity, was); /* cancelled, none failed before */
+        run_is(&c, "\"completed\",\"conclusion\":\"failure\"");
+        CHECK(strcmp(c.activity, was)); /* failed */
+        SAME(c.builds, "failed 1111111111111111111111111111111111111111");
+        snprintf(was, sizeof was, "%s", c.activity);
+        run_is(&c, "\"in_progress\"");
+        SAME(c.activity, was); /* run again */
+        run_is(&c, "\"completed\",\"conclusion\":\"cancelled\"");
+        SAME(c.activity, was); /* cancelled */
+        gh("repos/o/nightly/releases?per_page=100&page=1",
+           "[{\"tag_name\":\"pr-7\",\"html_url\":\"https://n/pr-7\",\"published_at\":\"2026-10-20T12:00:00Z\","
+           "\"body\":\"built from /commits/1111111111111111111111111111111111111111\",\"assets\":[]}]");
+        drawn_pr(&c);
+        CHECK(strcmp(c.activity, was)); /* published */
+        SAME(c.builds, "published 1111111111111111111111111111111111111111");
+        snprintf(was, sizeof was, "%s", c.activity);
+        json = rei_format(pr7, "false", 1, "", "1111111111111111111111111111111111111111");
+        gh("repos/o/r/pulls/7", json);
+        free(json);
+        gh("repos/o/r/issues/7/comments?per_page=100&page=1",
+           "[{\"user\":{\"login\":\"bia\",\"type\":\"User\"},\"body\":\"Works\",\"html_url\":\"https://c/7\","
+           "\"created_at\":\"2026-10-20T12:00:00Z\"}]");
+        drawn_pr(&c);
+        CHECK(strcmp(c.activity, was)); /* a comment */
+        snprintf(was, sizeof was, "%s", c.activity);
+        json = rei_format(pr7, "true", 1, "", "1111111111111111111111111111111111111111");
+        gh("repos/o/r/pulls/7", json);
+        free(json);
+        drawn_pr(&c);
+        CHECK(strcmp(c.activity, was)); /* a draft */
+        snprintf(was, sizeof was, "%s", c.activity);
+        json = rei_format(pr7, "true", 1, "{\"name\":\"x\"}", "1111111111111111111111111111111111111111");
+        gh("repos/o/r/pulls/7", json);
+        free(json);
+        drawn_pr(&c);
+        SAME(c.activity, was); /* a label: where it is */
+        /* a push: its builds none yet, the push before's outcome not its own; then its own published */
+        json = rei_format(pr7, "true", 1, "{\"name\":\"x\"}", "4444444444444444444444444444444444444444");
+        gh("repos/o/r/pulls/7", json);
+        free(json);
+        gh("repos/o/r/compare/2222222222222222222222222222222222222222...4444444444444444444444444444444444444444",
+           "{\"merge_base_commit\":{\"sha\":\"3333333333333333333333333333333333333333\"}}");
+        gh("repos/o/r/actions/workflows/build.yml/runs?head_sha=4444444444444444444444444444444444444444&per_page=100&"
+           "page=1",
+           "{\"workflow_runs\":[]}");
+        drawn_pr(&c);
+        CHECK(strcmp(c.activity, was) && !*c.builds); /* a push */
+        snprintf(was, sizeof was, "%s", c.activity);
+        gh("repos/o/nightly/releases?per_page=100&page=1",
+           "[{\"tag_name\":\"pr-7\",\"html_url\":\"https://n/pr-7\",\"published_at\":\"2026-10-20T13:00:00Z\","
+           "\"body\":\"built from /commits/4444444444444444444444444444444444444444\",\"assets\":[]}]");
+        drawn_pr(&c);
+        CHECK(strcmp(c.activity, was)); /* its own published */
+        SAME(c.builds, "published 4444444444444444444444444444444444444444");
+        json = rei_format(pr7, "true", 1, "{\"name\":\"x\"}", "5555555555555555555555555555555555555555");
+        gh("repos/o/r/pulls/7", json);
+        free(json);
+        gh("repos/o/r/compare/2222222222222222222222222222222222222222...5555555555555555555555555555555555555555",
+           "{\"merge_base_commit\":{\"sha\":\"3333333333333333333333333333333333333333\"}}");
+        gh("repos/o/r/actions/workflows/build.yml/runs?head_sha=5555555555555555555555555555555555555555&per_page=100&"
+           "page=1",
+           "{\"workflow_runs\":[]}");
+        drawn_pr(&c);
+        snprintf(was, sizeof was, "%s", c.activity);
+        json = rei_format(pr7, "true", 1, "{\"name\":\"x\"}", "6666666666666666666666666666666666666666");
+        gh("repos/o/r/pulls/7", json);
+        free(json);
+        gh("repos/o/r/compare/2222222222222222222222222222222222222222...6666666666666666666666666666666666666666",
+           "{\"merge_base_commit\":{\"sha\":\"3333333333333333333333333333333333333333\"}}");
+        gh("repos/o/r/actions/workflows/build.yml/runs?head_sha=6666666666666666666666666666666666666666&per_page=100&"
+           "page=1",
+           "{\"workflow_runs\":[]}");
+        drawn_pr(&c);
+        CHECK(strcmp(c.activity, was) && !*c.builds); /* a push, no builds on either side */
+        /* in a round: the card's outcome carried into its drawing and out of it, and kept in the state */
+        {
+            Cards r;
+            cJSON *saved, *back;
+            char *state, *kept, failed_moved[17], running_moved[17];
+            u64 message = c_post(NULL, 2, NULL);
+            int before;
+            json = rei_format(pr7, "false", 1, "", "1111111111111111111111111111111111111111");
+            gh("repos/o/r/pulls/7", json);
+            free(json);
+            gh("repos/o/nightly/releases?per_page=100&page=1", "[]");
+            c.builds[0] = 0;
+            run_is(&c, "\"in_progress\"");
+            snprintf(running_moved, sizeof running_moved, "%s", c.activity);
+            run_is(&c, "\"completed\",\"conclusion\":\"failure\"");
+            snprintf(failed_moved, sizeof failed_moved, "%s", c.activity);
+            gh("repos/o/r/issues?state=all&sort=updated&direction=desc&since=2026-10-20T10:00:00Z&per_page=100&page=1",
+               "[]");
+            gh("repos/o/r/actions/workflows/build.yml/runs?per_page=20", "{\"workflow_runs\":[]}");
+            gh("repos/o/r/commits/main", "{\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}");
+            /* failed before, running again now: no move, the outcome kept */
+            run_is(&c, "\"in_progress\"");
+            state =
+                rei_format("{\"cards\":[{\"key\":\"pr-7\",\"message\":\"%llu\",\"drawn\":\"x\",\"moved\":\"%s\","
+                           "\"builds\":\"failed 1111111111111111111111111111111111111111\",\"dirty\":true}],"
+                           "\"since\":\"2026-10-20T10:00:00Z\",\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+                           "\"purged_prs\":true}",
+                           (unsigned long long)message, failed_moved);
+            saved = cJSON_Parse(state);
+            cd_init(&r, &g, dc, 2, 0, 0);
+            cd_load(&r, saved);
+            before = nsent;
+            now_is += 30;
+            cd_round(&r);
+            CHECK(nsent == before && r.cards[0].message == message && !r.cards[0].dirty);
+            SAME(r.cards[0].builds, "failed 1111111111111111111111111111111111111111");
+            cd_free(&r);
+            cJSON_Delete(saved);
+            free(state);
+            /* running before, failed now: moved, the outcome learnt and saved */
+            run_is(&c, "\"completed\",\"conclusion\":\"failure\"");
+            state = rei_format("{\"cards\":[{\"key\":\"pr-7\",\"message\":\"%llu\",\"drawn\":\"x\",\"moved\":\"%s\","
+                               "\"builds\":\"\",\"dirty\":true}],\"since\":\"2026-10-20T10:00:00Z\",\"head\":"
+                               "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"purged_prs\":true}",
+                               (unsigned long long)message, running_moved);
+            saved = cJSON_Parse(state);
+            cd_init(&r, &g, dc, 2, 0, 0);
+            cd_load(&r, saved);
+            now_is += 30;
+            cd_round(&r);
+            CHECK(nsent == before + 1 && r.cards[0].message == sent[nsent - 1].message);
+            SAME(r.cards[0].builds, "failed 1111111111111111111111111111111111111111");
+            back = cd_save(&r);
+            kept = cJSON_PrintUnformatted(back);
+            HAS(kept, "\"builds\":\"failed 1111111111111111111111111111111111111111\"");
+            free(kept);
+            cJSON_Delete(back);
+            cd_free(&r);
+            cJSON_Delete(saved);
+            free(state);
+        }
+    }
     /* GraphQL failing: no card from what is missing */
     answer("POST", "https://api.github.com/graphql", 502, "{}");
     CHECK(!cd_pr(&c, 7, &open, &closed) && c.failed);
