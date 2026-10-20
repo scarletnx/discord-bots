@@ -664,7 +664,8 @@ static void pr_card(void) {
        "[{\"tag_name\":\"nightly-2026-10-20-3333333\",\"html_url\":\"https://n/1\",\"published_at\":\"2026-10-20T10:00:00Z\"},"
        "{\"tag_name\":\"pr-7\",\"html_url\":\"https://n/pr-7\",\"published_at\":\"2026-10-20T11:00:00Z\","
        "\"body\":\"built from /commits/1111111111111111111111111111111111111111\",\"assets\":[{\"name\":"
-       "\"ScarletNX-windows-x86_64.zip\",\"size\":12345678,\"browser_download_url\":\"https://n/w\"}]}]");
+       "\"ScarletNX-windows-x86_64.zip\",\"size\":12345678,\"browser_download_url\":\"https://n/w\"},"
+       "{\"name\":\"ScarletNX-linux-ppc64.AppImage\",\"size\":2345678,\"browser_download_url\":\"https://n/p\"}]}]");
     gh("repos/o/r/actions/workflows/build.yml/runs?head_sha=1111111111111111111111111111111111111111&per_page=100&page=1",
        "{\"workflow_runs\":[{\"id\":9,\"event\":\"pull_request\",\"status\":\"in_progress\",\"html_url\":\"https://r/9\","
        "\"created_at\":\"2026-10-20T11:00:00Z\"}]}");
@@ -692,11 +693,14 @@ static void pr_card(void) {
     HAS(text, "{\"name\":\"Android\",\"value\":\"Failed\\n[log](https://j/2)\",\"inline\":true}");
     HAS(text, "{\"name\":\"macOS ARM64\",\"value\":\"Waiting\",\"inline\":true}"); /* its job queued */
     HAS(text, "{\"name\":\"iOS ARM64\",\"value\":\"Waiting\",\"inline\":true}");
+    HAS(text, "{\"name\":\"Linux PowerPC64 LE\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Linux "
+              "PowerPC64 BE\",\"value\":\"[AppImage (Linux programs)](https://n/p)\\n2.3 MB\",\"inline\":true},"
+              "{\"name\":\"Linux RISC-V 64\"");
     HAS(text, "{\"name\":\"Linux RISC-V 64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Linux "
               "LoongArch64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Windows x86-64\"");
     /* the jobs that make no file after the packages: what their tests did */
-    HAS(text, "{\"name\":\"iOS ARM64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Linux PowerPC64 BE\","
-              "\"value\":\"Tests failed\\n[log](https://j/4)\",\"inline\":true},{\"name\":\"Build\"");
+    HAS(text, "{\"name\":\"iOS ARM64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Linux PowerPC64 BE "
+              "ELFv1 tests\",\"value\":\"Tests failed\\n[log](https://j/4)\",\"inline\":true},{\"name\":\"Build\"");
     HAS(text, "{\"name\":\"Build\",\"value\":\"[Running](https://r/9)\",\"inline\":true}");
     HAS(text, "{\"name\":\"Builds\",\"value\":\"[All files](https://n/pr-7)\",\"inline\":true}");
     HAS(text, "\"color\":2066493"); /* GitHub's green: open */

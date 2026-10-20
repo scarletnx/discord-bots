@@ -35,6 +35,7 @@ static const struct {
     {"ScarletNX-linux-x86_64.AppImage", "Linux AppImage (x86_64)", "Linux", "x86-64", "AppImage"},
     {"ScarletNX-linux-aarch64.AppImage", "Linux AppImage (aarch64)", "Linux", "ARM64", "AppImage"},
     {"ScarletNX-linux-ppc64le.AppImage", "Linux AppImage (ppc64le)", "Linux", "PowerPC64 LE", "AppImage"},
+    {"ScarletNX-linux-ppc64.AppImage", "Linux AppImage (ppc64)", "Linux", "PowerPC64 BE", "AppImage (Linux programs)"},
     {"ScarletNX-linux-riscv64.AppImage", "Linux AppImage (riscv64)", "Linux", "RISC-V 64", "AppImage"},
     {"ScarletNX-linux-loongarch64.AppImage", "Linux AppImage (loongarch64)", "Linux", "LoongArch64", "AppImage"},
     {"ScarletNX-windows-x86_64.zip", "Windows (Clang + LLVM)", "Windows", "x86-64", "zip"},
@@ -43,11 +44,11 @@ static const struct {
     {"ScarletNX-ios-arm64.ipa", "macOS and iOS (arm64)", "iOS", "ARM64", "IPA"},
 };
 #define NPACKAGES (int)(sizeof PACKAGES / sizeof *PACKAGES)
-/* Build's jobs that make no release file, shown after the packages: each job and what it tests (CHECKS in ScarletNX's
-   scripts/discord-cards.py) */
+/* Build's jobs that make no release file, shown after the packages: each job, as build.yml names it, and what it
+   tests */
 static const struct {
     const char *job, *field;
-} CHECKS[] = {{"Linux (ppc64, cross)", "Linux PowerPC64 BE"}};
+} CHECKS[] = {{"Linux (ppc64, cross)", "Linux PowerPC64 BE ELFv1 tests"}};
 #define NCHECKS (int)(sizeof CHECKS / sizeof *CHECKS)
 
 static const char* S(const char* s) { return s ? s : ""; }
