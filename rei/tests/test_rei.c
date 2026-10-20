@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include "cards.h"
+#include "event.h"
 #include "link.h"
 #include "look.h"
 #include "refs.h"
@@ -742,6 +743,114 @@ static void state_tests(void) {
     cJSON_Delete(s);
 }
 
+/* ---- the gateway's events, read from their JSON ---- */
+static int message(const char* json, EvMessage* m) { return ev_message(json, strlen(json), m); }
+static char* ready_user(const char* json) { return ev_ready_user(json, strlen(json)); }
+static void event_tests(void) {
+    EvMessage m;
+    Buf b = {0};
+    size_t before;
+    const char* framed =
+        "{\"id\":\"7\",\"channel_id\":\"8\",\"content\":\"#1\",\"author\":{\"id\":\"1\"}},\"s\":5,\"op\":0}";
+    char* user;
+    /* a person's, its strings unescaped (Concord left them as sent: \" and é in the text) */
+    CHECK(message("{\"id\":\"1430000000000000000\",\"channel_id\":\"555555555555555555\",\"content\":\"he said "
+                  "\\\"#160\\\" \\\\ caf\\u00e9 \\ud83d\\ude00\\n\",\"author\":{\"id\":\"1\",\"username\":\"ana\","
+                  "\"bot\":false},\"embeds\":[],\"member\":{\"roles\":[]}}",
+                  &m));
+    CHECK(m.id == 1430000000000000000ULL && m.channel == 555555555555555555ULL);
+    SAME(m.content, "he said \"#160\" \\ caf\xc3\xa9 \xf0\x9f\x98\x80\n");
+    ev_message_free(&m);
+    CHECK(!m.content && !m.id);
+    /* a reply: its own author counts, not the one it answers */
+    CHECK(message(
+        "{\"id\":\"2\",\"channel_id\":\"3\",\"content\":\"#5\",\"author\":{\"id\":\"1\"},\"referenced_message\":"
+        "{\"id\":\"9\",\"channel_id\":\"3\",\"content\":\"card\",\"author\":{\"id\":\"4\",\"bot\":true}}}",
+        &m));
+    SAME(m.content, "#5");
+    ev_message_free(&m);
+    CHECK(!message("{\"id\":\"9\",\"channel_id\":\"3\",\"content\":\"#5\",\"author\":{\"id\":\"4\",\"bot\":true},"
+                   "\"referenced_message\":{\"id\":\"2\",\"channel_id\":\"3\",\"author\":{\"id\":\"1\"}}}",
+                   &m) &&
+          !m.content);
+    /* a webhook's (the old cards), one with no author, ids that are no snowflakes, no JSON: never answered */
+    CHECK(!message(
+              "{\"id\":\"2\",\"channel_id\":\"3\",\"content\":\"#5\",\"author\":{\"id\":\"1\"},\"webhook_id\":\"6\"}",
+              &m) &&
+          !m.content && !m.id && !m.channel);
+    CHECK(!message("{\"id\":\"2\",\"channel_id\":\"3\",\"content\":\"#5\"}", &m));
+    CHECK(!message("{\"id\":\"2\",\"channel_id\":\"3\",\"content\":\"#5\",\"author\":null}", &m));
+    CHECK(!message("{\"id\":\"2a\",\"channel_id\":\"3\",\"content\":\"#5\",\"author\":{\"id\":\"1\"}}", &m));
+    CHECK(!message("{\"id\":2,\"channel_id\":\"3\",\"content\":\"#5\",\"author\":{\"id\":\"1\"}}", &m));
+    CHECK(!message("{\"id\":\"-2\",\"channel_id\":\"3\",\"content\":\"#5\",\"author\":{\"id\":\"1\"}}", &m));
+    CHECK(!message("{\"id\":\"2\",\"content\":\"#5\",\"author\":{\"id\":\"1\"}}", &m));
+    CHECK(!message("{\"id\":\"2\",\"channel_id\":\"3\",", &m) && !message("", &m) && !message("[1]", &m));
+    /* the event as the gateway hands it: its object, then the rest of the frame, read only as far as told */
+    CHECK(!ev_message(framed, (size_t)(strstr(framed, "\"author\"") - framed), &m));
+    CHECK(ev_message(framed, (size_t)(strstr(framed, ",\"s\"") - framed), &m));
+    CHECK(m.id == 7 && m.channel == 8);
+    SAME(m.content, "#1");
+    ev_message_free(&m);
+    /* files alone: no text */
+    CHECK(
+        message("{\"id\":\"2\",\"channel_id\":\"3\",\"author\":{\"id\":\"1\"},\"attachments\":[{\"id\":\"4\"}]}", &m));
+    SAME(m.content, "");
+    ev_message_free(&m);
+    /* a long one, as the messages of 2 to 3 KB that crashed Concord's decoder */
+    buf_add(&b,
+            "{\"id\":\"2\",\"channel_id\":\"3\",\"author\":{\"id\":\"1\"},\"embeds\":[{\"type\":\"video\",\"provider\":"
+            "{\"name\":\"x\"},\"video\":{\"url\":\"https://v\",\"width\":1280}}],\"content\":\"");
+    before = b.len;
+    while (b.len - before < 4000) buf_add(&b, "word ");
+    buf_add(&b, "#160\"}");
+    CHECK(message(b.text, &m));
+    CHECK(m.content && strlen(m.content) == b.len - before - 2 && strstr(m.content, " #160"));
+    ev_message_free(&m);
+    buf_free(&b);
+    /* READY's user */
+    user = ready_user("{\"v\":10,\"user\":{\"id\":\"1\",\"username\":\"ReiWimsy\",\"bot\":true},\"session_id\":\"s\"}");
+    SAME(user, "ReiWimsy");
+    free(user);
+    CHECK(!ready_user("{\"user\":{\"username\":7}}") && !ready_user("{\"v\":10}") && !ready_user("nope"));
+}
+/* the messages waiting: oldest first, across the end of the ring; a full queue refuses one, which stays its caller's */
+static void queue_tests(void) {
+    static EvQueue q;
+    EvMessage m;
+    int i, ordered = 1, taken = 1;
+    ev_queue_init(&q);
+    for (i = 0; i < EV_WAITING; ++i) {
+        m.id = (u64)i + 1;
+        m.channel = 3;
+        m.content = rei_format("#%d", i + 1);
+        taken &= ev_push(&q, &m) && !m.content;
+    }
+    CHECK(taken);
+    m.id = 999;
+    m.channel = 3;
+    m.content = rei_strdup("#999");
+    CHECK(!ev_push(&q, &m) && m.id == 999);
+    SAME(m.content, "#999");
+    ev_message_free(&m);
+    /* half out, as many in: the ring wraps */
+    for (i = 0; i < EV_WAITING / 2; ++i) {
+        ev_pop(&q, &m);
+        ordered &= m.id == (u64)i + 1;
+        ev_message_free(&m);
+        m.id = (u64)(EV_WAITING + i + 1);
+        m.content = rei_format("#%d", EV_WAITING + i + 1);
+        ev_push(&q, &m);
+    }
+    for (i = EV_WAITING / 2; i < EV_WAITING + EV_WAITING / 2; ++i) {
+        char want[16];
+        ev_pop(&q, &m);
+        sprintf(want, "#%d", i + 1);
+        ordered &= m.id == (u64)i + 1 && !strcmp(m.content, want);
+        ev_message_free(&m);
+    }
+    CHECK(ordered && q.n == 0);
+}
+
 int main(void) {
     rei_now = clock_now;
     refs();
@@ -753,6 +862,8 @@ int main(void) {
     cards_tests();
     pr_card();
     state_tests();
+    event_tests();
+    queue_tests();
     printf("reiwimsy: %d of %d checks passed\n", checks - failures, checks);
     return failures ? 1 : 0;
 }
