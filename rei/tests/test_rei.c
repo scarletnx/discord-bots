@@ -672,7 +672,9 @@ static void pr_card(void) {
        "{\"jobs\":[{\"name\":\"Linux AppImage (x86_64)\",\"status\":\"in_progress\",\"html_url\":\"https://j/1\"},"
        "{\"name\":\"Android APK\",\"status\":\"completed\",\"conclusion\":\"failure\",\"html_url\":\"https://j/2\"},"
        "{\"name\":\"Linux AppImage (aarch64)\",\"status\":\"completed\",\"conclusion\":\"success\"},"
-       "{\"name\":\"macOS and iOS (arm64)\",\"status\":\"queued\",\"html_url\":\"https://j/3\"}]}");
+       "{\"name\":\"macOS and iOS (arm64)\",\"status\":\"queued\",\"html_url\":\"https://j/3\"},"
+       "{\"name\":\"Linux (ppc64, cross)\",\"status\":\"completed\",\"conclusion\":\"failure\","
+       "\"html_url\":\"https://j/4\"}]}");
     answer("POST", "https://api.github.com/graphql", 200,
            "{\"data\":{\"repository\":{\"pullRequest\":{\"closingIssuesReferences\":{\"nodes\":[]}}}}}");
     e = cd_pr(&c, 7, &open, &closed);
@@ -690,6 +692,11 @@ static void pr_card(void) {
     HAS(text, "{\"name\":\"Android\",\"value\":\"Failed\\n[log](https://j/2)\",\"inline\":true}");
     HAS(text, "{\"name\":\"macOS ARM64\",\"value\":\"Waiting\",\"inline\":true}"); /* its job queued */
     HAS(text, "{\"name\":\"iOS ARM64\",\"value\":\"Waiting\",\"inline\":true}");
+    HAS(text, "{\"name\":\"Linux RISC-V 64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Linux "
+              "LoongArch64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Windows x86-64\"");
+    /* the jobs that make no file after the packages: what their tests did */
+    HAS(text, "{\"name\":\"iOS ARM64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Linux PowerPC64 BE\","
+              "\"value\":\"Tests failed\\n[log](https://j/4)\",\"inline\":true},{\"name\":\"Build\"");
     HAS(text, "{\"name\":\"Build\",\"value\":\"[Running](https://r/9)\",\"inline\":true}");
     HAS(text, "{\"name\":\"Builds\",\"value\":\"[All files](https://n/pr-7)\",\"inline\":true}");
     HAS(text, "\"color\":2066493"); /* GitHub's green: open */

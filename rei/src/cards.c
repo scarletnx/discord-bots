@@ -35,12 +35,20 @@ static const struct {
     {"ScarletNX-linux-x86_64.AppImage", "Linux AppImage (x86_64)", "Linux", "x86-64", "AppImage"},
     {"ScarletNX-linux-aarch64.AppImage", "Linux AppImage (aarch64)", "Linux", "ARM64", "AppImage"},
     {"ScarletNX-linux-ppc64le.AppImage", "Linux AppImage (ppc64le)", "Linux", "PowerPC64 LE", "AppImage"},
+    {"ScarletNX-linux-riscv64.AppImage", "Linux AppImage (riscv64)", "Linux", "RISC-V 64", "AppImage"},
+    {"ScarletNX-linux-loongarch64.AppImage", "Linux AppImage (loongarch64)", "Linux", "LoongArch64", "AppImage"},
     {"ScarletNX-windows-x86_64.zip", "Windows (Clang + LLVM)", "Windows", "x86-64", "zip"},
     {"ScarletNX-android-universal.apk", "Android APK", "Android", "ARM64, x86-64", "APK"},
     {"ScarletNX-macos-arm64.zip", "macOS and iOS (arm64)", "macOS", "ARM64", "zip"},
     {"ScarletNX-ios-arm64.ipa", "macOS and iOS (arm64)", "iOS", "ARM64", "IPA"},
 };
 #define NPACKAGES (int)(sizeof PACKAGES / sizeof *PACKAGES)
+/* Build's jobs that make no release file, shown after the packages: each job and what it tests (CHECKS in ScarletNX's
+   scripts/discord-cards.py) */
+static const struct {
+    const char *job, *field;
+} CHECKS[] = {{"Linux (ppc64, cross)", "Linux PowerPC64 BE"}};
+#define NCHECKS (int)(sizeof CHECKS / sizeof *CHECKS)
 
 static const char* S(const char* s) { return s ? s : ""; }
 
@@ -283,7 +291,8 @@ static const cJSON* named(const cJSON* list, const char* key, const char* name) 
     cJSON_ArrayForEach(item, list) if (!strcmp(S(jstr(item, key)), name)) found = item; /* the last, as a dict keeps */
     return found;
 }
-/* a field per release file: published, its link and size; else what its job does; built: what a built one waits for */
+/* a field per release file: published, its link and size; else what its job does; built: what a built one waits for.
+   Then a field per job of CHECKS: what its tests did */
 static void packages(cJSON* fields, const cJSON* jobs, const cJSON* release, const char* built) {
     int i;
     for (i = 0; i < NPACKAGES; ++i) {
@@ -310,6 +319,24 @@ static void packages(cJSON* fields, const cJSON* jobs, const cJSON* release, con
                                              : rei_format("%s %s", PACKAGES[i].system, PACKAGES[i].arch);
         field(fields, name, v.text);
         free(name);
+        buf_free(&v);
+    }
+    for (i = 0; i < NCHECKS; ++i) {
+        const cJSON* job = named(jobs, "name", CHECKS[i].job);
+        const char *status = S(jstr(job, "status")), *conclusion = S(jstr(job, "conclusion"));
+        Buf v = {0};
+        if (!job || !strcmp(status, "queued") || !strcmp(status, "waiting") || !strcmp(status, "pending") ||
+            !strcmp(status, "requested"))
+            buf_add(&v, "Waiting");
+        else if (strcmp(status, "completed"))
+            buf_printf(&v, "Testing\n[log](%s)", S(jstr(job, "html_url")));
+        else if (!strcmp(conclusion, "success"))
+            buf_add(&v, "Tests passed");
+        else if (!strcmp(conclusion, "cancelled") || !strcmp(conclusion, "skipped"))
+            capitalized(&v, conclusion);
+        else
+            buf_printf(&v, "Tests failed\n[log](%s)", S(jstr(job, "html_url")));
+        field(fields, CHECKS[i].field, v.text);
         buf_free(&v);
     }
 }
