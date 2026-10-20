@@ -16,7 +16,7 @@ DEFS = -D_POSIX_C_SOURCE=200809L
 OURS = $(WARN) $(DEFS) -Isrc -Ithird_party/cjson
 
 LOGIC = src/util.o src/refs.o src/github.o src/look.o src/link.o src/cards.o src/state.o src/rest.o \
-	third_party/cjson/cJSON.o
+	src/event.o third_party/cjson/cJSON.o
 
 all: reiwimsy
 
@@ -27,7 +27,7 @@ test: tests/test_rei
 	./tests/test_rei
 
 tests/test_rei: $(LOGIC) tests/test_rei.c
-	$(CC) $(CFLAGS) $(OURS) -o $@ tests/test_rei.c $(LOGIC) -lm
+	$(CC) $(CFLAGS) $(OURS) -o $@ tests/test_rei.c $(LOGIC) -lpthread -lm
 
 src/util.o: src/util.c src/rei.h
 	$(CC) $(CFLAGS) $(OURS) -c -o $@ src/util.c
@@ -45,10 +45,12 @@ src/state.o: src/state.c src/state.h src/rei.h
 	$(CC) $(CFLAGS) $(OURS) -c -o $@ src/state.c
 src/rest.o: src/rest.c src/rest.h src/github.h src/rei.h
 	$(CC) $(CFLAGS) $(OURS) -c -o $@ src/rest.c
+src/event.o: src/event.c src/event.h src/rei.h
+	$(CC) $(CFLAGS) $(OURS) -c -o $@ src/event.c
 src/http.o: src/http.c src/http.h src/github.h src/rei.h
 	$(CC) $(CFLAGS) $(OURS) $(CURL_CFLAGS) -c -o $@ src/http.c
 # Concord's headers are not ours: their warnings are theirs
-src/main.o: src/main.c src/cards.h src/http.h src/link.h src/rest.h src/state.h src/rei.h
+src/main.o: src/main.c src/cards.h src/event.h src/http.h src/link.h src/rest.h src/state.h src/rei.h
 	$(CC) $(CFLAGS) $(OURS) $(CURL_CFLAGS) -isystem $(CONCORD)/include/concord -c -o $@ src/main.c
 # cJSON as its project builds it
 third_party/cjson/cJSON.o: third_party/cjson/cJSON.c third_party/cjson/cJSON.h

@@ -45,8 +45,9 @@ while the `REIWIMSY_` ones are unset, the log saying so. It keeps GitHub's answe
 
     make -C rei test && python3 xuji/test_xuji.py
 
-No network and no Discord: the parsing, the replies and their edits, GitHub's ETags and pages, Discord's waits and
-answers, the cards (drawn, posted, edited, deleted a day after they close, reposted when deleted by hand), the state
+No network and no Discord: the parsing, the gateway's events (read from their JSON: Concord decodes none of them, as
+its decoder crashed on messages of 2 to 3 KB) and the messages waiting for an answer, the replies and their edits,
+GitHub's ETags and pages, Discord's waits and answers, the cards (drawn, posted, edited, deleted a day after they close, reposted when deleted by hand), the state
 file; Xuji's privacy scrub, transcript and prompts.
 
 ## Deploy (on the jail's host, as root)

@@ -6,8 +6,9 @@
     [GITHUB_TOKEN=...] [REIWIMSY_CARDS_PRS=id] [REIWIMSY_CARDS_ISSUES=id] [REIWIMSY_CARDS_NIGHTLY=id]
     [REIWIMSY_STATE=file] reiwimsy
 
-Concord's gateway brings the messages, each answered on a worker thread; a thread of its own draws the cards every
-ROUND seconds and edits the replies whose items changed every LK_REFRESH. The cards need GITHUB_TOKEN (GitHub allows
+Concord's gateway brings the events, read here from their JSON (event.h), never decoded by Concord; a person's message
+waits for the thread that answers them, one at a time. A thread of its own draws the cards every ROUND seconds and
+edits the replies whose items changed every LK_REFRESH. The cards need GITHUB_TOKEN (GitHub allows
 60 requests an hour without one), and so does the replies' editing. linkbot's LINKBOT_TOKEN, LINKBOT_REPO,
 LINKBOT_NIGHTLY, LINKBOT_CHANNELS and LINKBOT_STATE are read for the REIWIMSY_ ones while those are unset, said once */
 #define _POSIX_C_SOURCE 200809L
@@ -23,6 +24,7 @@ LINKBOT_NIGHTLY, LINKBOT_CHANNELS and LINKBOT_STATE are read for the REIWIMSY_ o
 #include <discord.h> /* Concord's */
 
 #include "cards.h"
+#include "event.h"
 #include "http.h"
 #include "link.h"
 #include "rest.h"
@@ -44,6 +46,7 @@ static Cards cards;
 static Dc dc;
 static cJSON* cards_saved; /* the cards as the last round left them, for rei_save */
 static pthread_mutex_t link_lock = PTHREAD_MUTEX_INITIALIZER, save_lock = PTHREAD_MUTEX_INITIALIZER;
+static EvQueue waiting;
 
 static const char* const KNOWN[] = {"REIWIMSY_TOKEN",        "REIWIMSY_REPO",         "REIWIMSY_NIGHTLY",
                                     "REIWIMSY_CHANNELS",     "REIWIMSY_STATE",        "REIWIMSY_CARDS_PRS",
@@ -184,51 +187,75 @@ static void* rounds(void* unused) {
     return NULL;
 }
 
+/* each waiting message answered, one at a time: an answer asks GitHub, which takes a while */
+static void* answers(void* unused) {
+    (void)unused;
+    for (;;) {
+        EvMessage m;
+        int numbers[REI_MOST], n = 0;
+        cJSON* e;
+        u64 id;
+        ev_pop(&waiting, &m);
+        pthread_mutex_lock(&link_lock);
+        e = lk_answer(&replies, m.content, numbers, &n);
+        pthread_mutex_unlock(&link_lock);
+        if (e && (id = dc_post(&dc, m.channel, e, m.id)) && n) {
+            pthread_mutex_lock(&link_lock);
+            lk_keep(&replies, m.channel, id, numbers, n, e);
+            pthread_mutex_unlock(&link_lock);
+            save_all();
+        }
+        cJSON_Delete(e);
+        ev_message_free(&m);
+    }
+    return NULL;
+}
+static void start(void* (*run)(void*), const char* what) {
+    pthread_t thread;
+    int code = pthread_create(&thread, NULL, run, NULL);
+    if (code) stop("the thread of %s", rei_format("%s did not start: %s", what, strerror(code)));
+    pthread_detach(thread);
+}
+
+/* READY, at each new session: the threads started at the first */
+static void ready(const char* json, size_t size) {
+    static int started;
+    char* user = ev_ready_user(json, size);
+    if (user)
+        rei_log("up as %s for %s; cards: pull requests %s, issues %s, nightlies %s", user, env.repo,
+                env.prs ? "on" : "off", env.issues ? "on" : "off", env.nightlies ? "on" : "off");
+    else
+        rei_log("up for %s, its READY naming no user; cards: pull requests %s, issues %s, nightlies %s", env.repo,
+                env.prs ? "on" : "off", env.issues ? "on" : "off", env.nightlies ? "on" : "off");
+    free(user);
+    if (!env.github) rei_log("no GITHUB_TOKEN: its replies stay as sent");
+    if (!started) {
+        start(rounds, "the cards and the replies' edits");
+        start(answers, "the answers");
+        started = 1;
+    }
+}
+/* MESSAGE_CREATE: a person's message in a channel the replies answer in waits for its answer; a bot's or a webhook's
+   (a card) never gets one */
+static void take(const char* json, size_t size) {
+    EvMessage m;
+    int i, here = !env.nchannels;
+    if (!ev_message(json, size, &m)) return;
+    for (i = 0; i < env.nchannels; ++i) here |= env.channels[i] == m.channel;
+    if (here && !ev_push(&waiting, &m))
+        rei_log("%d messages wait for an answer already: message %llu in channel %llu gets none", EV_WAITING,
+                (unsigned long long)m.id, (unsigned long long)m.channel);
+    ev_message_free(&m);
+}
+/* Concord's gateway thread, before Concord decodes anything: each event the bot reads is read here, from its JSON, and
+   none is left to Concord, whose decoder of MESSAGE_CREATE crashed the bot (SIGSEGV, SIGBUS) on messages of 2 to 3
+   KB. READY's session is Concord's own before this */
 static enum discord_event_scheduler scheduler(struct discord* client, const char data[], size_t size,
                                               enum discord_gateway_events event) {
     (void)client;
-    (void)data;
-    (void)size;
-    /* an answer asks GitHub, which takes a while: never on the thread that keeps the gateway's heartbeat */
-    return event == DISCORD_EV_MESSAGE_CREATE ? DISCORD_EVENT_WORKER_THREAD : DISCORD_EVENT_MAIN_THREAD;
-}
-static void on_ready(struct discord* client, const struct discord_ready* ready) {
-    static int started;
-    static pthread_mutex_t once = PTHREAD_MUTEX_INITIALIZER;
-    pthread_t thread;
-    (void)client;
-    rei_log("up as %s for %s; cards: pull requests %s, issues %s, nightlies %s",
-            ready->user ? ready->user->username : "?", env.repo, env.prs ? "on" : "off", env.issues ? "on" : "off",
-            env.nightlies ? "on" : "off");
-    if (!env.github) rei_log("no GITHUB_TOKEN: its replies stay as sent");
-    pthread_mutex_lock(&once);
-    if (!started && pthread_create(&thread, NULL, rounds, NULL) == 0) {
-        pthread_detach(thread);
-        started = 1;
-    }
-    pthread_mutex_unlock(&once);
-}
-static void on_message(struct discord* client, const struct discord_message* m) {
-    int numbers[REI_MOST], n = 0, i, here = !env.nchannels;
-    cJSON* e;
-    u64 id;
-    (void)client;
-    /* a bot's or a webhook's message (a card) is never answered */
-    if (!m->author || m->author->bot || m->webhook_id) return;
-    for (i = 0; i < env.nchannels; ++i) here |= env.channels[i] == m->channel_id;
-    if (!here) return;
-    pthread_mutex_lock(&link_lock);
-    e = lk_answer(&replies, m->content ? m->content : "", numbers, &n);
-    pthread_mutex_unlock(&link_lock);
-    if (!e) return;
-    id = dc_post(&dc, m->channel_id, e, m->id);
-    if (id && n) {
-        pthread_mutex_lock(&link_lock);
-        lk_keep(&replies, m->channel_id, id, numbers, n, e);
-        pthread_mutex_unlock(&link_lock);
-        save_all();
-    }
-    cJSON_Delete(e);
+    if (event == DISCORD_EV_READY) ready(data, size);
+    if (event == DISCORD_EV_MESSAGE_CREATE) take(data, size);
+    return DISCORD_EVENT_IGNORE;
 }
 
 int main(void) {
@@ -257,16 +284,15 @@ int main(void) {
     cd_load(&cards, cJSON_GetObjectItemCaseSensitive(saved, "cards"));
     cards_saved = cd_save(&cards);
     cJSON_Delete(saved);
+    ev_queue_init(&waiting);
     memset(&config, 0, sizeof config);
     config.token = (char*)env.token;
     config.log.level = LOGMOD_LEVEL_WARN; /* Concord's traces name every event: only what goes wrong is logged */
     client = discord_from_config(&config);
     if (!client) stop("Concord could not start a client with REIWIMSY_TOKEN%s", "");
-    discord_add_intents(client,
-                        DISCORD_GATEWAY_GUILDS | DISCORD_GATEWAY_GUILD_MESSAGES | DISCORD_GATEWAY_MESSAGE_CONTENT);
+    discord_add_intents(client, DISCORD_GATEWAY_GUILDS | DISCORD_GATEWAY_GUILD_MESSAGES |
+                                    DISCORD_GATEWAY_DIRECT_MESSAGES | DISCORD_GATEWAY_MESSAGE_CONTENT);
     discord_set_event_scheduler(client, scheduler);
-    discord_set_on_ready(client, on_ready);
-    discord_set_on_message_create(client, on_message);
     code = discord_run(client);
     rei_log("the gateway stopped: %s", discord_strerror(code, client));
     discord_cleanup(client);
