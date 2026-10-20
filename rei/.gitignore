@@ -1,0 +1,3 @@
+*.o
+/reiwimsy
+/tests/test_rei
