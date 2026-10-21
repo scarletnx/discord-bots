@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""aogowimsy.py without Discord or the network: its env file, MCP over stdio in a real subprocess, and its tools
-against a fake Discord served on 127.0.0.1, with a clock that only moves when a tool waits"""
+"""aogowimsy.py without Discord or the network: its env file, MCP over stdio in a real subprocess, its tools against a
+fake Discord REST served on 127.0.0.1 with a clock that only moves when a tool waits, what the gateway hears and
+pushes to the session, and the gateway client itself against a fake WebSocket gateway on 127.0.0.1"""
 
+import base64
+import hashlib
 import http.server
 import json
 import os
+import queue
 import re
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -18,15 +24,17 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import aogowimsy as aw
 
-os.environ['no_proxy'] = os.environ['NO_PROXY'] = '127.0.0.1'  # the fake Discord, never through a proxy
+os.environ['no_proxy'] = os.environ['NO_PROXY'] = '127.0.0.1'  # the fakes, never through a proxy
 
 TOKEN = 'MTAwMDAw.fake-token_for.tests'
-BOT, OWNER, FRIEND, STRANGER = (f'10000000000000000{n:02d}' for n in (1, 2, 3, 4))
+BOT, OWNER, FRIEND, STRANGER, OTHER_PERSON = (f'10000000000000000{n:02d}' for n in (1, 2, 3, 4, 5))
 GUILD = '200000000000000001'
-GENERAL, HELP, OTHER, THREAD, OTHER_THREAD = (f'3000000000000000{n:02d}' for n in (1, 2, 3, 11, 12))
-DM = '400000000000000001'
+GENERAL, HELP, OTHER, THREAD, OTHER_THREAD, NEW_THREAD = (f'3000000000000000{n:02d}' for n in (1, 2, 3, 11, 12, 13))
+DM, FRIEND_DM, STRANGER_DM = '400000000000000001', '400000000000000002', '400000000000000003'
+WIMSY = f'{aw.WIMSY}:600000000000000001'  # the owner's custom emoji, as a reaction's path names it
+OTHER_EMOJI = 'wimsyother:600000000000000002'
 YES, NO = aw.YES, aw.NO
-META = {aw.VERSION_KEY: '2026-07-28', aw.CAPABILITIES_KEY: {}}
+INITIALIZE = {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'test', 'version': '1'}}
 
 
 class FakeDiscord:
@@ -35,6 +43,7 @@ class FakeDiscord:
     ROUTES = (
         ('GET', r'/users/@me', 'me'),
         ('POST', r'/users/@me/channels', 'open_dm'),
+        ('GET', r'/gateway/bot', 'gateway'),
         ('GET', r'/channels/(\d+)', 'channel'),
         ('GET', r'/channels/(\d+)/messages', 'history'),
         ('POST', r'/channels/(\d+)/messages', 'create'),
@@ -50,6 +59,7 @@ class FakeDiscord:
             OWNER: {'id': OWNER, 'username': 'dravee', 'global_name': 'DraVee'},
             FRIEND: {'id': FRIEND, 'username': 'friend', 'global_name': None},
             STRANGER: {'id': STRANGER, 'username': 'stranger', 'global_name': 'Stranger'},
+            OTHER_PERSON: {'id': OTHER_PERSON, 'username': 'other', 'global_name': 'Other'},
         }
         guild = {'type': 0, 'guild_id': GUILD}
         self.channels = {
@@ -58,22 +68,28 @@ class FakeDiscord:
             OTHER: dict(guild, id=OTHER, name='other'),
             THREAD: dict(guild, id=THREAD, name='a-thread', type=11, parent_id=GENERAL),
             OTHER_THREAD: dict(guild, id=OTHER_THREAD, name='elsewhere', type=11, parent_id=OTHER),
+            NEW_THREAD: dict(guild, id=NEW_THREAD, name='new-thread', type=11, parent_id=HELP),
             DM: {'id': DM, 'type': 1, 'recipients': [self.users[OWNER]]},
+            FRIEND_DM: {'id': FRIEND_DM, 'type': 1, 'recipients': [self.users[FRIEND]]},
+            STRANGER_DM: {'id': STRANGER_DM, 'type': 1, 'recipients': [self.users[STRANGER]]},
         }
         self.messages = {channel: [] for channel in self.channels}  # oldest first
         self.reactions = {}  # a message id: {emoji: [user ids]}
         self.requests = []  # (method, path, query, body)
         self.limits = []  # (method, path) answered 429 once each
         self.fail = {}  # (method, path): (status, body), answered until removed
+        self.gateway_url = 'ws://127.0.0.1:9/'
         self.serial = 1_500_000_000_000_000_000
         self.lock = threading.Lock()
 
-    def say(self, channel, author, content='', **extra):
+    def say(self, channel, author, content='', mentions=(), reply_to=None, **extra):
         """a message from author; its id"""
         self.serial += 1
         message = {'id': str(self.serial), 'channel_id': channel, 'author': author, 'content': content, 'type': 0}
         message.update(timestamp=f'2026-10-21T12:{len(self.messages[channel]) % 60:02d}:00.000000+00:00')
-        message.update(attachments=[], embeds=[])
+        message.update(attachments=[], embeds=[], mentions=list(mentions))
+        if reply_to:
+            message.update(type=19, message_reference={'message_id': reply_to, 'channel_id': channel})
         message.update(extra)
         self.messages[channel].append(message)
         return message['id']
@@ -93,15 +109,32 @@ class FakeDiscord:
     def posts(self, method, path):
         return [r for r in self.requests if r[0] == method and r[1] == path]
 
-    def render(self, message):
-        shown = {k: v for k, v in message.items() if k != 'author'}
-        shown['author'] = self.users.get(message['author'], {'id': message['author'], 'username': 'webhook'})
+    def user(self, who):
+        return self.users.get(who, {'id': who, 'username': 'webhook'})
+
+    def render(self, message, deep=True):
+        shown = {k: v for k, v in message.items() if k not in ('author', 'mentions')}
+        shown['author'] = self.user(message['author'])
+        shown['mentions'] = [self.user(who) for who in message.get('mentions', [])]
+        reference = message.get('message_reference')
+        if deep and reference and message.get('type') == 19:
+            answered = self.find(message['channel_id'], reference['message_id'])
+            shown['referenced_message'] = self.render(answered, deep=False) if answered else None
         reactions = self.reactions.get(message['id'], {})
         if reactions:
-            shown['reactions'] = [
-                {'count': len(who), 'me': BOT in who, 'emoji': {'id': None, 'name': emoji}}
-                for emoji, who in reactions.items()
-            ]
+            shown['reactions'] = []
+            for emoji, who in reactions.items():
+                name, _, number = emoji.partition(':')
+                shown['reactions'].append(
+                    {'count': len(who), 'me': BOT in who, 'emoji': {'id': number or None, 'name': name}}
+                )
+        return shown
+
+    def event(self, channel, message):
+        """a message as the gateway's MESSAGE_CREATE carries it"""
+        shown = self.render(self.find(channel, message))
+        if self.channels[channel].get('guild_id'):
+            shown['guild_id'] = self.channels[channel]['guild_id']
         return shown
 
     def handle(self, method, path, query, body, headers):
@@ -135,6 +168,9 @@ class FakeDiscord:
             return 400, {'message': f'fake: DMs only with the owner, not {body}', 'code': 0}, {}
         return 200, self.channels[DM], {}
 
+    def gateway(self, query, body):
+        return 200, {'url': self.gateway_url, 'shards': 1}, {}
+
     def channel(self, query, body, channel):
         if channel not in self.channels:
             return 404, {'message': 'Unknown Channel', 'code': 10003}, {}
@@ -153,20 +189,18 @@ class FakeDiscord:
     def create(self, query, body, channel):
         content = body.get('content', '')
         if len(content) > 2000:
-            errors = {
-                'content': {
-                    '_errors': [{'code': 'BASE_TYPE_MAX_LENGTH', 'message': 'Must be 2000 or fewer in length.'}]
-                }
-            }
+            message = 'Must be 2000 or fewer in length.'
+            errors = {'content': {'_errors': [{'code': 'BASE_TYPE_MAX_LENGTH', 'message': message}]}}
             return 400, {'code': 50035, 'errors': errors, 'message': 'Invalid Form Body'}, {}
         reference = body.get('message_reference')
-        extra = {'embeds': body.get('embeds', [])}
+        if reference and not self.find(channel, reference['message_id']):
+            return 400, {'code': 50035, 'message': 'Invalid Form Body', 'errors': {}}, {}
+        number = self.say(
+            channel, BOT, content, reply_to=reference and reference['message_id'], embeds=body.get('embeds', [])
+        )
         if reference:
-            if not self.find(channel, reference['message_id']):
-                return 400, {'code': 50035, 'message': 'Invalid Form Body', 'errors': {}}, {}
-            extra.update(type=19, message_reference=reference)
-        message = self.find(channel, self.say(channel, BOT, content, **extra))
-        return 200, self.render(message), {}
+            self.find(channel, number)['message_reference'] = reference
+        return 200, self.render(self.find(channel, number)), {}
 
     def message(self, query, body, channel, message):
         found = self.find(channel, message)
@@ -269,6 +303,17 @@ class EnvFile(unittest.TestCase):
         settings = aw.read_settings(self.env(GOOD_ENV))
         self.assertEqual(settings, aw.Settings(TOKEN, OWNER, frozenset({FRIEND}), frozenset({GENERAL, HELP})))
 
+    def test_without_channels_it_works_where_discord_lets_it_and_says_so(self):
+        settings = aw.read_settings(self.env(GOOD_ENV.replace(f'AOGOWIMSY_CHANNELS={GENERAL}, {HELP}\n', '')))
+        self.assertIsNone(settings.channels)
+        self.assertIn(
+            'every channel and thread Discord lets it see (AOGOWIMSY_CHANNELS lists none)', aw.instructions(settings)
+        )
+        listed = aw.instructions(settings._replace(channels=frozenset({GENERAL})))
+        self.assertIn(f'channels {GENERAL} and their threads', listed)
+        said = self.refused(GOOD_ENV.replace(f'{GENERAL}, {HELP}', ''))
+        self.assertIn('AOGOWIMSY_CHANNELS is empty: list id,id, or take the line out', said)
+
     def test_mode_600_and_stricter_are_taken(self):
         for mode in (0o600, 0o400):
             self.assertEqual(aw.read_settings(self.env(GOOD_ENV, mode)).owner, OWNER)
@@ -296,9 +341,8 @@ class EnvFile(unittest.TestCase):
         self.assertIn('AOGOWIMSY_USERS is missing', self.refused(GOOD_ENV.replace(f'AOGOWIMSY_USERS = {FRIEND}', '')))
 
     def test_a_key_twice_a_line_with_no_equals_and_a_bad_token_letter_never_show_the_token(self):
-        self.assertIn(
-            'line 7: AOGOWIMSY_OWNER again, set on line 3', self.refused(GOOD_ENV + f'AOGOWIMSY_OWNER={OWNER}\n')
-        )
+        said = self.refused(GOOD_ENV + f'AOGOWIMSY_OWNER={OWNER}\n')
+        self.assertIn('line 7: AOGOWIMSY_OWNER again, set on line 3', said)
         self.assertIn('line 7 has no "="', self.refused(GOOD_ENV + TOKEN + '\n'))
         said = self.refused(GOOD_ENV.replace(TOKEN, f'"{TOKEN}"'))
         self.assertIn("AOGOWIMSY_TOKEN has '\"' at letter 1", said)
@@ -330,16 +374,23 @@ class WithDiscord(unittest.TestCase):
         self.fake = self.http.fake = FakeDiscord()
         self.clock = FakeClock()
         self.settings = aw.Settings(TOKEN, OWNER, frozenset({FRIEND}), frozenset({GENERAL, HELP}))
-        api = f'http://127.0.0.1:{self.http.server_port}/api/v10'
-        self.bot = aw.AogoWimsy(self.settings, aw.Discord(TOKEN, self.clock, api), self.clock)
+        self.api = f'http://127.0.0.1:{self.http.server_port}/api/v10'
+        self.bot = aw.AogoWimsy(self.settings, aw.Discord(TOKEN, self.clock, self.api), self.clock)
         self.sent = []
-        self.server = aw.Server(self.bot, 'test', self.sent.append)
+        self.server = self.started_server(self.bot)
         self.logs = []
         self.addCleanup(setattr, aw, 'log', aw.log)
         aw.log = self.logs.append
 
-    def answer(self, name, meta=META, cancelled=None, **args):
-        params = {'name': name, 'arguments': args, '_meta': meta}
+    def started_server(self, bot, **extra):
+        server = aw.Server(bot, 'test', self.sent.append, **extra)
+        server.handle({'jsonrpc': '2.0', 'id': 0, 'method': 'initialize', 'params': INITIALIZE})
+        return server
+
+    def answer(self, name, meta=None, cancelled=None, **args):
+        params = {'name': name, 'arguments': args}
+        if meta:
+            params['_meta'] = meta
         return self.server.handle({'jsonrpc': '2.0', 'id': 7, 'method': 'tools/call', 'params': params}, cancelled)
 
     def tool(self, name, **args):
@@ -356,6 +407,12 @@ class WithDiscord(unittest.TestCase):
 
     def owner_answers(self, when, emoji, who=OWNER):
         self.clock.at(when, lambda: self.fake.react(self.fake.last(DM)['id'], emoji, who))
+
+    def arrive(self, channel, author, content='', **extra):
+        """a message Discord keeps and the gateway brings to the waits"""
+        number = self.fake.say(channel, author, content, **extra)
+        self.bot.hub.deliver(self.fake.event(channel, number))
+        return number
 
 
 class Post(WithDiscord):
@@ -391,9 +448,8 @@ class Post(WithDiscord):
         self.assertEqual(card['footer']['text'], f'waiting: to {GENERAL} replying to {asked}')
         self.assertEqual(self.fake.posts('POST', f'/channels/{DM}/messages')[0][3]['allowed_mentions'], {'parse': []})
         body = self.fake.posts('POST', f'/channels/{GENERAL}/messages')[0][3]
-        self.assertEqual(
-            body['message_reference'], {'message_id': asked, 'channel_id': GENERAL, 'fail_if_not_exists': True}
-        )
+        reference = {'message_id': asked, 'channel_id': GENERAL, 'fail_if_not_exists': True}
+        self.assertEqual(body['message_reference'], reference)
         self.assertEqual(got['status'], 'sent')
 
     def test_refused_posts_nothing_and_says_so_on_the_draft(self):
@@ -412,15 +468,8 @@ class Post(WithDiscord):
     def test_timed_out_then_approved_through_post_status_and_never_posted_twice(self):
         got = self.tool('discord_post', channel=GENERAL, text='hello', wait=7)
         draft = self.fake.last(DM)['id']
-        self.assertEqual(
-            got,
-            {
-                'status': 'waiting',
-                'draft': draft,
-                'link': f'https://discord.com/channels/@me/{DM}/{draft}',
-                'waited': 7,
-            },
-        )
+        link = f'https://discord.com/channels/@me/{DM}/{draft}'
+        self.assertEqual(got, {'status': 'waiting', 'draft': draft, 'link': link, 'waited': 7})
         self.assertEqual(self.clock.waits, [3.0, 3.0, 1.0])
         self.assertEqual(self.fake.messages[GENERAL], [])
         self.assertEqual(self.tool('discord_post_status', draft=draft, wait=0)['status'], 'waiting')
@@ -433,9 +482,8 @@ class Post(WithDiscord):
 
     def test_a_restart_loses_no_draft_the_draft_is_the_state(self):
         draft = self.tool('discord_post', channel=GENERAL, text='after a restart', wait=0)['draft']
-        api = f'http://127.0.0.1:{self.http.server_port}/api/v10'
-        fresh = aw.AogoWimsy(self.settings, aw.Discord(TOKEN, self.clock, api), self.clock)
-        self.server = aw.Server(fresh, 'test', self.sent.append)
+        fresh = aw.AogoWimsy(self.settings, aw.Discord(TOKEN, self.clock, self.api), self.clock)
+        self.server = self.started_server(fresh)
         self.fake.react(draft, YES, OWNER)
         self.assertEqual(self.tool('discord_post_status', draft=draft)['status'], 'sent')
         self.assertEqual(self.fake.last(GENERAL)['content'], 'after a restart')
@@ -449,14 +497,23 @@ class Post(WithDiscord):
 
     def test_a_channel_not_listed_is_refused_naming_it_and_the_list(self):
         said = self.error('discord_post', channel=OTHER, text='hello')
-        self.assertIn(
-            f'channel {OTHER} is not one AogoWimsy may post in: AOGOWIMSY_CHANNELS lists {GENERAL}, {HELP}', said
-        )
+        lists = f'channel {OTHER} is not one AogoWimsy may post in: AOGOWIMSY_CHANNELS lists {GENERAL}, {HELP}'
+        self.assertIn(lists, said)
         said = self.error('discord_post', channel=OTHER_THREAD, text='hello')
         self.assertIn(f'channel {OTHER_THREAD} is not one AogoWimsy may post in', said)
         said = self.error('discord_post', channel='3000000000000000099', text='hello')
         self.assertIn('Discord answered 404 to GET /channels/3000000000000000099: Unknown Channel (code 10003)', said)
         self.assertEqual(self.fake.messages[DM], [])
+
+    def test_with_no_channels_listed_any_channel_discord_shows_it_and_its_404_names_the_rest(self):
+        self.bot.settings = self.settings._replace(channels=None)
+        self.owner_answers(3, YES)
+        self.assertEqual(self.tool('discord_post', channel=OTHER, text='elsewhere')['status'], 'sent')
+        self.assertEqual(self.fake.last(OTHER)['content'], 'elsewhere')
+        said = self.error('discord_post', channel='3000000000000000099', text='hello')
+        self.assertEqual(
+            said, 'Discord answered 404 to GET /channels/3000000000000000099: Unknown Channel (code 10003)'
+        )
 
     def test_a_thread_of_a_listed_channel_is_one(self):
         self.owner_answers(3, YES)
@@ -466,10 +523,8 @@ class Post(WithDiscord):
         self.assertIn(f'#a-thread ({THREAD})', card['description'])
 
     def test_a_text_over_2000_letters_is_refused_naming_its_length(self):
-        self.assertIn(
-            'text has 2001 letters: a Discord message holds 2000 at most',
-            self.error('discord_post', channel=GENERAL, text='x' * 2001),
-        )
+        said = self.error('discord_post', channel=GENERAL, text='x' * 2001)
+        self.assertIn('text has 2001 letters: a Discord message holds 2000 at most', said)
         self.assertEqual(self.fake.messages[DM], [])
         self.assertEqual(self.tool('discord_post', channel=GENERAL, text='x' * 2000, wait=0)['status'], 'waiting')
         self.assertIn('text is empty', self.error('discord_post', channel=GENERAL, text=' \n'))
@@ -477,27 +532,20 @@ class Post(WithDiscord):
     def test_arguments_are_checked_before_discord_hears_of_them(self):
         said = self.error('discord_post', channel=int(GENERAL), text='hi')
         self.assertIn('channel is 300000000000000001, not a Discord id: write it as a string', said)
-        self.assertIn(
-            'wait is 3601, not a whole number from 0 to 3600',
-            self.error('discord_post', channel=GENERAL, text='hi', wait=3601),
-        )
-        self.assertIn(
-            'wait is true, not a whole number', self.error('discord_post', channel=GENERAL, text='hi', wait=True)
-        )
-        self.assertIn(
-            'discord_post has no argument "mention"; it takes channel, text, reply_to, wait',
-            self.error('discord_post', channel=GENERAL, text='hi', mention=True),
-        )
+        said = self.error('discord_post', channel=GENERAL, text='hi', wait=3601)
+        self.assertIn('wait is 3601, not a whole number from 0 to 3600', said)
+        said = self.error('discord_post', channel=GENERAL, text='hi', wait=True)
+        self.assertIn('wait is true, not a whole number', said)
+        said = self.error('discord_post', channel=GENERAL, text='hi', mention=True)
+        self.assertIn('discord_post has no argument "mention"; it takes channel, text, reply_to, wait', said)
         self.assertIn('discord_post needs text', self.error('discord_post', channel=GENERAL))
         self.assertIn('text is a JSON array, not a string', self.error('discord_post', channel=GENERAL, text=['hi']))
         self.assertEqual(self.fake.requests, [])
 
     def test_post_status_takes_only_its_own_drafts(self):
         mine = self.fake.say(DM, OWNER, 'a message of the owner')
-        self.assertIn(
-            f"message {mine} in the owner's DMs ({DM}) is not a draft of AogoWimsy's",
-            self.error('discord_post_status', draft=mine),
-        )
+        said = self.error('discord_post_status', draft=mine)
+        self.assertIn(f"message {mine} in the owner's DMs ({DM}) is not a draft of AogoWimsy's", said)
         plain = self.fake.say(DM, BOT, 'a plain message of its own')
         self.assertIn('is not a draft', self.error('discord_post_status', draft=plain))
 
@@ -508,9 +556,8 @@ class Post(WithDiscord):
         )
         self.owner_answers(3, YES)
         said = self.error('discord_post', channel=GENERAL, text='hello')
-        self.assertIn(
-            f'Discord answered 403 to POST /channels/{GENERAL}/messages: Missing Permissions (code 50013)', said
-        )
+        refused = f'Discord answered 403 to POST /channels/{GENERAL}/messages: Missing Permissions (code 50013)'
+        self.assertIn(refused, said)
         draft = self.fake.last(DM)
         self.assertEqual(self.fake.footer(draft), f'waiting: to {GENERAL}')
         self.assertIn('Posting failed: Discord answered 403', draft['embeds'][0]['description'])
@@ -530,9 +577,8 @@ class Post(WithDiscord):
         got = self.tool('discord_post', channel=HELP, text='hello', wait=0)
         self.bot.settings = self.settings._replace(channels=frozenset({GENERAL}))
         self.fake.react(got['draft'], YES, OWNER)
-        self.assertIn(
-            f'channel {HELP} is not one AogoWimsy may post in', self.error('discord_post_status', draft=got['draft'])
-        )
+        said = self.error('discord_post_status', draft=got['draft'])
+        self.assertIn(f'channel {HELP} is not one AogoWimsy may post in', said)
         self.assertEqual(self.fake.messages[HELP], [])
 
 
@@ -540,7 +586,7 @@ class Read(WithDiscord):
     def conversation(self, channel):
         ids = [self.fake.say(channel, OWNER, 'first', attachments=[{'filename': 'build.log', 'url': 'x'}])]
         ids.append(self.fake.say(channel, STRANGER, 'a secret of the stranger'))
-        ids.append(self.fake.say(channel, FRIEND, 'a reply', type=19, message_reference={'message_id': ids[0]}))
+        ids.append(self.fake.say(channel, FRIEND, 'a reply', reply_to=ids[0]))
         ids.append(self.fake.say(channel, BOT, 'its own'))
         ids.append(self.fake.say(channel, '1000000000000000099', 'a webhook', webhook_id='1000000000000000099'))
         return ids
@@ -552,7 +598,7 @@ class Read(WithDiscord):
         self.assertEqual((got['left_out'], got['after'], got['channel']), (2, ids[4], GENERAL))
         first, reply = got['messages'][0], got['messages'][1]
         self.assertEqual((first['author'], first['author_id'], first['text']), ('DraVee', OWNER, 'first'))
-        self.assertEqual((first['attachments'], first['reply_to']), (['build.log'], None))
+        self.assertEqual((first['attachments'], first['reply_to'], first['approved']), (['build.log'], None, False))
         self.assertEqual((reply['author'], reply['reply_to']), ('friend', ids[0]))
         self.assertTrue(first['time'].startswith('2026-10-21T12:'))
         self.assertNotIn('stranger', json.dumps(got).lower())
@@ -571,9 +617,48 @@ class Read(WithDiscord):
         self.assertEqual((newest['messages'], newest['left_out'], newest['after']), ([], 1, ids[4]))
         empty = self.tool('discord_read', channel=GENERAL, after=ids[4])
         self.assertEqual((empty['messages'], empty['after']), ([], ids[4]))
+        said = self.error('discord_read', channel=GENERAL, limit=101)
+        self.assertIn('limit is 101, not a whole number from 1 to 100', said)
+
+    def test_from_gives_only_those_authors_and_refuses_anyone_else(self):
+        ids = self.conversation(GENERAL)
+        got = self.tool('discord_read', channel=GENERAL, **{'from': [FRIEND]})
+        self.assertEqual(([m['id'] for m in got['messages']], got['left_out']), ([ids[2]], 4))
+        both = self.tool('discord_read', channel=GENERAL, **{'from': [OWNER, FRIEND]})
+        self.assertEqual([m['id'] for m in both['messages']], [ids[0], ids[2]])
+        said = self.error('discord_read', channel=GENERAL, **{'from': [FRIEND, STRANGER]})
+        self.assertEqual(said, f'from item 2 is {STRANGER}, neither the owner ({OWNER}) nor a listed user ({FRIEND})')
         self.assertIn(
-            'limit is 101, not a whole number from 1 to 100', self.error('discord_read', channel=GENERAL, limit=101)
+            'from is []: a list of 1 or more ids', self.error('discord_read', channel=GENERAL, **{'from': []})
         )
+        self.assertIn(
+            'from item 1 is "abc", not a Discord id', self.error('discord_read', channel=GENERAL, **{'from': ['abc']})
+        )
+
+    def test_a_strangers_message_to_aogo_the_owner_let_through_is_read_and_marked(self):
+        mine = self.fake.say(GENERAL, BOT, 'a post of mine')
+        let = self.fake.say(GENERAL, STRANGER, 'quoting you', reply_to=mine)
+        other = self.fake.say(GENERAL, STRANGER, 'me too', mentions=[BOT])
+        plain = self.fake.say(GENERAL, STRANGER, 'not to aogo')
+        self.fake.react(let, WIMSY, OWNER)
+        self.fake.react(other, WIMSY, OTHER_PERSON)
+        self.fake.react(plain, WIMSY, OWNER)
+        got = self.tool('discord_read', channel=GENERAL)
+        self.assertEqual([(m['id'], m['approved']) for m in got['messages']], [(mine, False), (let, True)])
+        self.assertEqual(got['left_out'], 2)
+        self.assertNotIn('me too', json.dumps(got))
+        self.assertTrue(self.fake.posts('GET', f'/channels/{GENERAL}/messages/{let}/reactions/{WIMSY}'))
+        named = self.tool('discord_read', channel=GENERAL, **{'from': [OWNER]})
+        self.assertEqual((named['messages'], named['left_out']), ([], 4))
+
+    def test_a_message_the_owner_replied_to_mentioning_aogo_is_read_with_his_reply_in_the_page(self):
+        start = self.fake.say(GENERAL, FRIEND, 'before')
+        theirs = self.fake.say(GENERAL, STRANGER, 'a question for the room')
+        reply = self.fake.say(GENERAL, OWNER, 'asking <@1000000000000000001>', reply_to=theirs, mentions=[BOT])
+        got = self.tool('discord_read', channel=GENERAL, after=start)
+        self.assertEqual([(m['id'], m['approved']) for m in got['messages']], [(theirs, True), (reply, False)])
+        alone = self.tool('discord_read', channel=GENERAL, after=start, limit=1)  # no reply in the page, none heard
+        self.assertEqual((alone['messages'], alone['left_out']), ([], 1))
 
     def test_a_thread_of_a_listed_channel_and_the_owners_dm_read_without_being_listed(self):
         ids = self.conversation(THREAD)
@@ -584,12 +669,14 @@ class Read(WithDiscord):
 
     def test_other_channels_are_refused_naming_what_it_reads(self):
         said = self.error('discord_read', channel=OTHER)
-        self.assertIn(
-            f'channel {OTHER} is not one AogoWimsy may read: AOGOWIMSY_CHANNELS lists {GENERAL}, {HELP}', said
-        )
+        lists = f'channel {OTHER} is not one AogoWimsy may read: AOGOWIMSY_CHANNELS lists {GENERAL}, {HELP}'
+        self.assertIn(lists, said)
         self.assertIn(f"the owner's DMs with AogoWimsy are {DM}", said)
         self.assertIn('may read', self.error('discord_read', channel=OTHER_THREAD))
         self.assertFalse(self.fake.posts('GET', f'/channels/{OTHER}/messages'))
+        self.bot.settings = self.settings._replace(channels=None)
+        self.fake.say(OTHER, OWNER, 'anywhere')
+        self.assertEqual([m['text'] for m in self.tool('discord_read', channel=OTHER)['messages']], ['anywhere'])
 
 
 class Wait(WithDiscord):
@@ -597,13 +684,23 @@ class Wait(WithDiscord):
         start = self.fake.say(GENERAL, OWNER, 'go')
         self.fake.say(GENERAL, STRANGER, 'noise')
         self.fake.say(GENERAL, BOT, 'its own')
-        self.clock.at(6, lambda: self.fake.say(GENERAL, STRANGER, 'more noise'))
-        self.clock.at(9, lambda: self.fake.say(GENERAL, FRIEND, 'here'))
+        self.clock.at(2, lambda: self.arrive(GENERAL, STRANGER, 'more noise'))
+        self.clock.at(3, lambda: self.arrive(GENERAL, FRIEND, 'here'))
         got = self.tool('discord_wait', channel=GENERAL, after=start)
         self.assertEqual((got['message']['text'], got['message']['author_id'], got['left_out']), ('here', FRIEND, 2))
         self.assertEqual(got['after'], got['message']['id'])
-        self.assertEqual(self.clock.waits, [3.0, 3.0, 3.0])
+        self.assertEqual(self.clock.waits, [1.0, 1.0, 1.0])
         self.assertNotIn('noise', json.dumps(got))
+        self.assertEqual(len(self.fake.posts('GET', f'/channels/{GENERAL}/messages')), 1)  # the gateway, not polling
+
+    def test_from_waits_only_for_those_authors(self):
+        start = self.fake.say(GENERAL, OWNER, 'go')
+        self.clock.at(1, lambda: self.arrive(GENERAL, OWNER, 'not this one'))
+        self.clock.at(2, lambda: self.arrive(GENERAL, FRIEND, 'this one'))
+        got = self.tool('discord_wait', channel=GENERAL, after=start, **{'from': [FRIEND]})
+        self.assertEqual((got['message']['text'], got['left_out']), ('this one', 1))
+        said = self.error('discord_wait', channel=GENERAL, after=start, **{'from': [STRANGER]})
+        self.assertIn(f'from item 1 is {STRANGER}, neither the owner', said)
 
     def test_none_in_time_says_so_with_the_id_to_wait_after_next(self):
         start = self.fake.say(GENERAL, OWNER, 'go')
@@ -611,7 +708,7 @@ class Wait(WithDiscord):
         got = self.tool('discord_wait', channel=GENERAL, after=start, wait=5)
         self.assertEqual(got, {'channel': GENERAL, 'message': None, 'waited': 5, 'left_out': 1, 'after': noise})
 
-    def test_a_busy_channel_is_read_on_at_once_page_after_page(self):
+    def test_what_came_before_it_listened_is_read_from_rest_page_after_page(self):
         start = self.fake.say(GENERAL, OWNER, 'go')
         for n in range(150):
             self.fake.say(GENERAL, STRANGER, f'noise {n}')
@@ -619,14 +716,35 @@ class Wait(WithDiscord):
         got = self.tool('discord_wait', channel=GENERAL, after=start)
         self.assertEqual((got['message']['text'], got['left_out'], self.clock.waits), ('mine', 150, []))
 
+    def test_a_new_gateway_session_reads_what_went_unheard(self):
+        start = self.fake.say(GENERAL, OWNER, 'go')
+
+        def unheard():
+            self.fake.say(GENERAL, FRIEND, 'said while the gateway was down')
+            self.bot.hub.gap()
+
+        self.clock.at(2, unheard)
+        got = self.tool('discord_wait', channel=GENERAL, after=start)
+        self.assertEqual(got['message']['text'], 'said while the gateway was down')
+
     def test_a_thread_of_a_listed_channel_and_the_owners_dm(self):
         start = self.fake.say(THREAD, FRIEND, 'start')
-        self.clock.at(3, lambda: self.fake.say(THREAD, OWNER, 'in the thread'))
+        self.clock.at(3, lambda: self.arrive(THREAD, OWNER, 'in the thread'))
         self.assertEqual(self.tool('discord_wait', channel=THREAD, after=start)['message']['text'], 'in the thread')
         start = self.fake.say(DM, BOT, 'a draft')
-        self.clock.at(6, lambda: self.fake.say(DM, OWNER, 'answer in the DMs'))
+        self.clock.at(6, lambda: self.arrive(DM, OWNER, 'answer in the DMs'))
         self.assertEqual(self.tool('discord_wait', channel=DM, after=start)['message']['text'], 'answer in the DMs')
         self.assertIn('may read', self.error('discord_wait', channel=OTHER, after=start))
+
+    def test_a_stopped_gateway_is_an_error_naming_why(self):
+        start = self.fake.say(GENERAL, OWNER, 'go')
+        self.clock.at(2, lambda: self.bot.hub.stop('Discord closed the gateway with 4014: disallowed intents'))
+        said = self.error('discord_wait', channel=GENERAL, after=start)
+        self.assertEqual(
+            said,
+            'the gateway stopped (Discord closed the gateway with 4014: disallowed intents): discord_wait hears '
+            'nothing; discord_read reads',
+        )
 
 
 class RateLimits(WithDiscord):
@@ -647,117 +765,109 @@ class RateLimits(WithDiscord):
         self.assertEqual(said, f'Discord answered 403 to GET /channels/{HELP}/messages: Missing Access (code 50001)')
 
     def test_an_invalid_form_body_names_its_fields(self):
-        said = aw.reason(
-            {
-                'code': 50035,
-                'message': 'Invalid Form Body',
-                'errors': {'content': {'_errors': [{'message': 'Must be 2000 or fewer in length.'}]}},
-            }
-        )
+        errors = {'content': {'_errors': [{'message': 'Must be 2000 or fewer in length.'}]}}
+        said = aw.reason({'code': 50035, 'message': 'Invalid Form Body', 'errors': errors})
         self.assertEqual(said, 'Invalid Form Body (code 50035): content: Must be 2000 or fewer in length.')
 
 
 class Protocol(WithDiscord):
     """the JSON-RPC answers, in process"""
 
-    def ask(self, method, params=None, rid=1):
+    def ask(self, method, params=None, rid=1, server=None):
         message = {'jsonrpc': '2.0', 'id': rid, 'method': method}
         if params is not None:
             message['params'] = params
-        return self.server.handle(message)
+        return (server or self.server).handle(message)
 
-    def test_initialize_answers_the_clients_version_when_it_has_it_else_its_newest(self):
-        for asked, agreed in (('2025-06-18', '2025-06-18'), ('2024-11-05', '2024-11-05'), ('2099-01-01', '2025-11-25')):
+    def test_initialize_answers_the_clients_version_when_it_has_it_else_its_newest_and_says_it_is_a_channel(self):
+        for asked, agreed in (('2025-06-18', '2025-06-18'), ('2024-11-05', '2024-11-05'), ('2026-07-28', '2025-11-25')):
             server = aw.Server(self.bot, 'test', self.sent.append)
-            params = {'protocolVersion': asked, 'capabilities': {}, 'clientInfo': {'name': 't', 'version': '1'}}
-            result = server.handle({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': params})['result']
+            params = dict(INITIALIZE, protocolVersion=asked)
+            result = self.ask('initialize', params, server=server)['result']
             self.assertEqual(result['protocolVersion'], agreed)
-            self.assertEqual(result['capabilities'], {'tools': {}})
+            self.assertEqual(result['capabilities'], {'tools': {}, 'experimental': {'claude/channel': {}}})
             self.assertEqual(result['serverInfo']['name'], 'aogowimsy')
         self.assertEqual(self.ask('initialize', {})['error']['code'], -32602)
 
-    def test_before_initialize_and_with_no_version_a_request_is_refused_saying_what_it_takes(self):
-        error = self.ask('tools/list')['error']
-        self.assertEqual(error['code'], -32602)
-        self.assertIn(
-            '2026-07-28 with it, and 2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05 after initialize', error['message']
-        )
-        self.assertEqual(self.ask('ping'), {'jsonrpc': '2.0', 'id': 1, 'result': {}})
-        self.ask('initialize', {'protocolVersion': '2025-11-25'})
-        self.assertEqual(self.ask('tools/list')['result']['tools'], aw.TOOLS)
-        self.assertNotIn('resultType', self.ask('tools/list')['result'])
-
-    def test_2026_07_28_requests_carry_their_version_and_get_results_with_resultType(self):
-        result = self.ask('tools/list', {'_meta': META})['result']
-        self.assertEqual(
-            [t['name'] for t in result['tools']],
-            ['discord_post', 'discord_post_status', 'discord_read', 'discord_wait'],
-        )
-        self.assertEqual(
-            (result['resultType'], result['ttlMs'], result['cacheScope']), ('complete', 3600000, 'private')
-        )
-        self.assertEqual(result['_meta'], {aw.SERVER_INFO_KEY: aw.SERVER_INFO})
-        found = self.ask('server/discover', {'_meta': META})['result']
-        self.assertEqual(
-            found['supportedVersions'], ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05']
-        )
-        self.assertEqual((found['capabilities'], found['instructions']), ({'tools': {}}, 'test'))
-
-    def test_a_version_it_lacks_is_unsupported_naming_those_it_has(self):
-        error = self.ask('tools/list', {'_meta': {aw.VERSION_KEY: '1900-01-01', aw.CAPABILITIES_KEY: {}}})['error']
-        self.assertEqual(error['code'], -32022)
-        self.assertEqual(
-            error['data'],
-            {
-                'supported': ['2026-07-28', '2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'],
-                'requested': '1900-01-01',
-            },
-        )
-        error = self.ask('tools/list', {'_meta': {aw.VERSION_KEY: '2026-07-28'}})['error']
-        self.assertEqual(error['code'], -32602)
-        self.assertIn(aw.CAPABILITIES_KEY, error['message'])
-
-    def test_methods_it_has_not_and_unknown_tools(self):
-        error = self.ask('resources/list', {'_meta': META})['error']
+    def test_2026_07_28_is_not_spoken_so_a_client_falls_back_to_initialize(self):
+        server = aw.Server(self.bot, 'test', self.sent.append)
+        meta = {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities': {},
+        }
+        error = self.ask('server/discover', {'_meta': meta}, server=server)['error']
         self.assertEqual(error['code'], -32601)
         self.assertIn(
-            '"resources/list"; AogoWimsy answers initialize, ping, server/discover, tools/list, tools/call',
-            error['message'],
+            'speaks the initialize handshake (2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05)', error['message']
         )
-        self.assertEqual(self.ask('ping', {'_meta': META})['error']['code'], -32601)
-        error = self.ask('tools/call', {'name': 'discord_delete', 'arguments': {}, '_meta': META})['error']
+        error = self.ask('tools/list', {'_meta': meta}, server=server)['error']
+        self.assertEqual(error['code'], -32602)
+        self.assertIn('tools/list came before initialize; AogoWimsy speaks 2025-11-25', error['message'])
+        self.assertEqual(self.ask('ping', server=server), {'jsonrpc': '2.0', 'id': 1, 'result': {}})
+        self.assertEqual(self.ask('tools/list')['result'], {'tools': aw.TOOLS})
+
+    def test_it_starts_hearing_discord_once_the_client_is_initialized_and_only_then(self):
+        calls = []
+
+        def listen(push):
+            calls.append(push)
+            return [aw.started(lambda: None)]
+
+        server = aw.Server(self.bot, 'test', self.sent.append, listen=listen)
+        server.handle({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+        self.assertEqual(calls, [])  # no initialize yet
+        self.ask('initialize', INITIALIZE, server=server)
+        self.assertEqual(calls, [])
+        server.handle({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+        server.handle({'jsonrpc': '2.0', 'method': 'notifications/initialized'})
+        self.assertEqual(calls, [server.push])
+        calls[0]('a text', {'kind': 'message'})
+        self.assertEqual(
+            self.sent[-1],
+            {
+                'jsonrpc': '2.0',
+                'method': 'notifications/claude/channel',
+                'params': {'content': 'a text', 'meta': {'kind': 'message'}},
+            },
+        )
+        server.stop()
+        self.assertTrue(server.stopping.is_set())
+
+    def test_methods_it_has_not_and_unknown_tools(self):
+        error = self.ask('resources/list')['error']
+        self.assertEqual(error['code'], -32601)
+        self.assertIn('"resources/list"; AogoWimsy answers initialize, ping, tools/list, tools/call', error['message'])
+        error = self.ask('tools/call', {'name': 'discord_delete', 'arguments': {}})['error']
         self.assertEqual(error['code'], -32602)
         self.assertIn('Unknown tool: "discord_delete"; AogoWimsy has discord_post', error['message'])
-        self.assertEqual(self.ask('tools/list', {'_meta': META, 'cursor': 'x'})['error']['code'], -32602)
+        self.assertEqual(self.ask('tools/list', {'cursor': 'x'})['error']['code'], -32602)
 
     def test_notifications_and_bad_messages(self):
         self.assertIsNone(self.server.handle({'jsonrpc': '2.0', 'method': 'notifications/initialized'}))
-        self.assertIsNone(
-            self.server.handle({'jsonrpc': '2.0', 'method': 'notifications/cancelled', 'params': {'requestId': 9}})
-        )
+        cancel = {'jsonrpc': '2.0', 'method': 'notifications/cancelled', 'params': {'requestId': 9}}
+        self.assertIsNone(self.server.handle(cancel))
         self.assertEqual(self.server.handle({'id': 1, 'method': 'ping'})['error']['code'], -32600)
         self.assertEqual(self.server.handle({'jsonrpc': '2.0', 'id': None, 'method': 'ping'})['error']['code'], -32600)
-        self.assertEqual(
-            self.server.handle({'jsonrpc': '2.0', 'id': 2, 'method': 'ping', 'params': [1]})['error']['code'], -32602
-        )
+        params = {'jsonrpc': '2.0', 'id': 2, 'method': 'ping', 'params': [1]}
+        self.assertEqual(self.server.handle(params)['error']['code'], -32602)
 
     def test_a_cancelled_wait_stops_and_gets_no_answer(self):
         cancelled = threading.Event()
-        self.clock.at(6, cancelled.set)
+        self.clock.at(2, cancelled.set)
         start = self.fake.say(GENERAL, OWNER, 'go')
         self.assertIsNone(self.answer('discord_wait', cancelled=cancelled, channel=GENERAL, after=start))
-        self.assertEqual(self.clock.waits, [3.0, 3.0])
+        self.assertEqual(self.clock.waits, [1.0, 1.0])
 
     def test_progress_when_asked_for_it_always_growing(self):
         start = self.fake.say(GENERAL, OWNER, 'go')
-        self.clock.at(9, lambda: self.fake.say(GENERAL, FRIEND, 'here'))
-        answer = self.answer('discord_wait', meta=dict(META, progressToken='p1'), channel=GENERAL, after=start)
+        self.clock.at(3, lambda: self.arrive(GENERAL, FRIEND, 'here'))
+        answer = self.answer('discord_wait', meta={'progressToken': 'p1'}, channel=GENERAL, after=start)
         here = json.loads(answer['result']['content'][0]['text'])['message']
         self.assertEqual(here['text'], 'here')
         sent = [(n['params']['progressToken'], n['params']['progress'], n['params']['total']) for n in self.sent]
-        self.assertEqual(sent, [('p1', 3.0, 600), ('p1', 6.0, 600), ('p1', 9.0, 600)])
+        self.assertEqual(sent, [('p1', 1.0, 600), ('p1', 2.0, 600), ('p1', 3.0, 600)])
         self.assertTrue(all(n['method'] == 'notifications/progress' for n in self.sent))
-        self.assertIsNone(self.tool('discord_wait', channel=GENERAL, after=here['id'], wait=6)['message'])
+        self.assertIsNone(self.tool('discord_wait', channel=GENERAL, after=here['id'], wait=2)['message'])
         self.assertEqual(len(self.sent), 3)  # asked for none: none sent
 
     def test_progress_never_repeats_nor_goes_back_and_stops_once_cancelled(self):
@@ -770,8 +880,514 @@ class Protocol(WithDiscord):
         self.assertEqual([n['params']['progress'] for n in self.sent], [1.0, 2.0])
 
 
+class Channels(WithDiscord):
+    """what the gateway hears and what reaches the session as a channel event"""
+
+    def setUp(self):
+        super().setUp()
+        self.pushes = []
+        self.ear = aw.Ear(self.bot, lambda text, meta: self.pushes.append((text, meta)), threading.Event())
+        self.ear.hear('READY', {'user': {'id': BOT}, 'session_id': 's', 'resume_gateway_url': 'ws://127.0.0.1:9'})
+        guild = {'id': GUILD, 'channels': [self.fake.channels[c] for c in (GENERAL, HELP, OTHER)]}
+        guild['threads'] = [self.fake.channels[THREAD], self.fake.channels[OTHER_THREAD]]
+        self.ear.hear('GUILD_CREATE', guild)
+
+    def heard(self, channel, author, content='', **extra):
+        number = self.fake.say(channel, author, content, **extra)
+        self.ear.hear('MESSAGE_CREATE', self.fake.event(channel, number))
+        return number
+
+    def reacted(self, channel, message, emoji, who):
+        self.fake.react(message, emoji, who)
+        name, _, number = emoji.partition(':')
+        event = {'user_id': who, 'channel_id': channel, 'message_id': message, 'guild_id': GUILD}
+        self.ear.hear('MESSAGE_REACTION_ADD', dict(event, emoji={'id': number or None, 'name': name}))
+
+    def test_a_reply_to_aogo_from_the_owner_is_pushed_once_with_its_fields(self):
+        mine = self.fake.say(GENERAL, BOT, 'a post of mine')
+        files = [{'filename': 'log;1\n.txt'}, {'filename': 'shot.png'}]
+        number = self.heard(GENERAL, OWNER, 'is this it?', reply_to=mine, attachments=files)
+        meta = {'kind': 'message', 'author': 'DraVee', 'author_id': OWNER, 'channel': GENERAL, 'message_id': number}
+        meta.update(reply_to=mine, attachments='log_1_.txt; shot.png')
+        self.assertEqual(self.pushes, [('is this it?', meta)])
+        self.assertEqual(self.logs, ['channel: pushed a message event'])
+
+    def test_a_mention_from_a_listed_user_is_pushed(self):
+        number = self.heard(HELP, FRIEND, '<@1000000000000000001> look', mentions=[BOT])
+        meta = {'kind': 'message', 'author': 'friend', 'author_id': FRIEND, 'channel': HELP, 'message_id': number}
+        self.assertEqual(self.pushes, [('<@1000000000000000001> look', meta)])
+
+    def test_a_message_not_addressed_to_aogo_is_not_pushed(self):
+        theirs = self.fake.say(GENERAL, FRIEND, 'a post of a friend')
+        self.heard(GENERAL, OWNER, 'talking to the room')
+        self.heard(GENERAL, OWNER, 'answering the friend', reply_to=theirs)
+        self.heard(GENERAL, OWNER, 'naming someone', mentions=[FRIEND])
+        self.heard(GENERAL, BOT, 'its own, naming itself', mentions=[BOT])
+        self.assertEqual(self.pushes, [])
+
+    def test_a_strangers_message_to_aogo_reaches_the_session_only_on_the_owners_wimsy_once(self):
+        mine = self.fake.say(GENERAL, BOT, 'a post of mine')
+        quoted = self.heard(GENERAL, STRANGER, 'quoting you', reply_to=mine)
+        self.assertEqual(self.pushes, [])
+        self.reacted(GENERAL, quoted, WIMSY, OTHER_PERSON)
+        self.reacted(GENERAL, quoted, OTHER_EMOJI, OWNER)
+        self.reacted(GENERAL, quoted, YES, OWNER)
+        self.assertEqual(self.pushes, [])
+        self.reacted(GENERAL, quoted, WIMSY, OWNER)
+        meta = {'kind': 'approved', 'author': 'Stranger', 'author_id': STRANGER, 'channel': GENERAL}
+        meta.update(message_id=quoted, reply_to=mine)
+        self.assertEqual(self.pushes, [('quoting you', meta)])
+        self.reacted(GENERAL, quoted, WIMSY, OWNER)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_the_owners_reply_mentioning_aogo_carries_the_message_he_replied_to_and_lets_it_through(self):
+        before = self.fake.say(GENERAL, FRIEND, 'before')
+        theirs = self.fake.say(GENERAL, STRANGER, 'a question for the room', attachments=[{'filename': 'crash.log'}])
+        asked = 'Gonna ask <@1000000000000000001>, lets see if this works'
+        number = self.heard(GENERAL, OWNER, asked, reply_to=theirs, mentions=[STRANGER, BOT])
+        quote = f'\n\nReplying to Stranger ({STRANGER}), message {theirs}:\na question for the room'
+        meta = {'kind': 'message', 'author': 'DraVee', 'author_id': OWNER, 'channel': GENERAL, 'message_id': number}
+        meta.update(
+            reply_to=theirs, quoted_author='Stranger', quoted_author_id=STRANGER, quoted_attachments='crash.log'
+        )
+        self.assertEqual(self.pushes, [(asked + quote, meta)])
+        self.assertEqual(self.bot.approved, {theirs})
+        self.reacted(GENERAL, theirs, WIMSY, OWNER)  # through already: once
+        self.assertEqual(len(self.pushes), 1)
+        got = self.tool('discord_read', channel=GENERAL, after=before)
+        self.assertEqual([(m['id'], m['approved']) for m in got['messages']], [(theirs, True), (number, False)])
+        self.assertEqual(got['left_out'], 0)
+        alone = self.tool('discord_read', channel=GENERAL, after=before, limit=1)  # his reply is not in this page
+        self.assertEqual([(m['id'], m['approved']) for m in alone['messages']], [(theirs, True)])
+
+    def test_a_reply_whose_answered_message_the_event_lacks_reads_it_from_discord(self):
+        theirs = self.fake.say(GENERAL, STRANGER, 'asked before')
+        number = self.fake.say(GENERAL, OWNER, 'see this <@1000000000000000001>', reply_to=theirs, mentions=[BOT])
+        event = self.fake.event(GENERAL, number)
+        del event['referenced_message']
+        self.ear.hear('MESSAGE_CREATE', event)
+        self.assertTrue(self.pushes[0][0].endswith(f'message {theirs}:\nasked before'))
+        self.assertEqual(len(self.fake.posts('GET', f'/channels/{GENERAL}/messages/{theirs}')), 1)
+
+    def test_only_the_owners_reply_with_a_mention_lets_a_message_through(self):
+        theirs = self.fake.say(GENERAL, STRANGER, 'a question for the room')
+        self.heard(GENERAL, FRIEND, 'asking <@1000000000000000001>', reply_to=theirs, mentions=[BOT])
+        self.heard(GENERAL, OWNER, 'answering them, no mention', reply_to=theirs)
+        self.assertEqual(
+            [(text, 'quoted_author_id' in meta) for text, meta in self.pushes],
+            [('asking <@1000000000000000001>', False)],
+        )
+        self.assertEqual(self.bot.approved, set())
+        self.assertNotIn(theirs, [m['id'] for m in self.tool('discord_read', channel=GENERAL)['messages']])
+
+    def test_the_owners_wimsy_elsewhere_pushes_nothing(self):
+        plain = self.heard(GENERAL, STRANGER, 'not to aogo')
+        own = self.heard(GENERAL, OWNER, 'his own, to aogo', mentions=[BOT])
+        outside = self.heard(OTHER, STRANGER, 'to aogo, in a channel not listed', mentions=[BOT])
+        self.pushes.clear()
+        for channel, message in ((GENERAL, plain), (GENERAL, own), (OTHER, outside)):
+            self.reacted(channel, message, WIMSY, OWNER)
+        self.assertEqual(self.pushes, [])
+
+    def test_the_owners_and_a_listed_users_dms_are_pushed_a_strangers_only_says_who_once(self):
+        self.heard(DM, BOT, 'a draft of its own, as the gateway brings it back')
+        self.heard(DM, OWNER, 'in my DMs')
+        self.heard(FRIEND_DM, FRIEND, 'in the friend DMs')
+        self.heard(STRANGER_DM, STRANGER, 'a secret to aogo')
+        self.heard(STRANGER_DM, STRANGER, 'and another')
+        self.assertEqual(
+            [(text, meta['kind']) for text, meta in self.pushes[:2]],
+            [('in my DMs', 'message'), ('in the friend DMs', 'message')],
+        )
+        knock = f'Stranger ({STRANGER}) wrote to AogoWimsy in DMs; nothing of what they wrote reaches the session'
+        self.assertEqual(self.pushes[2:], [(knock, {'kind': 'dm', 'author': 'Stranger', 'author_id': STRANGER})])
+        self.assertNotIn('secret', json.dumps(self.pushes))
+
+    def test_with_channels_listed_their_threads_count_and_others_do_not(self):
+        self.heard(OTHER, OWNER, 'to aogo elsewhere', mentions=[BOT])
+        self.heard(OTHER_THREAD, OWNER, 'to aogo in a thread elsewhere', mentions=[BOT])
+        self.assertEqual(self.pushes, [])
+        self.heard(THREAD, OWNER, 'to aogo in a thread of general', mentions=[BOT])
+        self.assertEqual([text for text, _ in self.pushes], ['to aogo in a thread of general'])
+        self.assertFalse(self.fake.posts('GET', f'/channels/{THREAD}'))  # known from GUILD_CREATE
+        self.heard(NEW_THREAD, FRIEND, 'to aogo in a new thread of help', mentions=[BOT])
+        self.assertEqual(self.pushes[-1][0], 'to aogo in a new thread of help')
+        self.assertEqual(len(self.fake.posts('GET', f'/channels/{NEW_THREAD}')), 1)  # asked once
+        self.heard(NEW_THREAD, FRIEND, 'again', mentions=[BOT])
+        self.assertEqual(len(self.fake.posts('GET', f'/channels/{NEW_THREAD}')), 1)
+
+    def test_with_no_channels_listed_every_channel_it_sees_counts(self):
+        self.bot.settings = self.settings._replace(channels=None)
+        self.heard(OTHER, OWNER, 'to aogo anywhere', mentions=[BOT])
+        self.assertEqual([text for text, _ in self.pushes], ['to aogo anywhere'])
+
+    def test_ready_and_the_guilds_push_nothing_and_ready_makes_the_waits_read_again(self):
+        self.assertEqual(self.pushes, [])
+        with self.bot.hub.listening(GENERAL) as inbox:
+            inbox.take()
+            self.ear.hear('READY', {'user': {'id': BOT}})
+            self.assertEqual(inbox.take(), ([], True))
+
+    def test_the_gateway_stopping_tells_the_session_and_the_waits(self):
+        self.ear.report('stopped', 'Discord closed the gateway with 4004')
+        self.assertEqual(self.bot.hub.stopped, 'Discord closed the gateway with 4004')
+        self.assertEqual(self.pushes[0][1], {'kind': 'error'})
+        self.assertIn('AogoWimsy stopped hearing Discord: Discord closed the gateway with 4004', self.pushes[0][0])
+
+    def test_the_ear_runs_apart_from_the_gateway_and_stops(self):
+        stop = threading.Event()
+        pushes = queue.Queue()
+        ear = aw.Ear(self.bot, lambda text, meta: pushes.put(text), stop)
+        thread = aw.started(ear.run)
+        number = self.fake.say(GENERAL, OWNER, 'to aogo', mentions=[BOT])
+        ear.feed('MESSAGE_CREATE', self.fake.event(GENERAL, number))
+        self.assertEqual(pushes.get(timeout=5), 'to aogo')
+        ear.feed('MESSAGE_CREATE', {'channel_id': GENERAL, 'guild_id': GUILD})
+        self.assertEqual(pushes.get(timeout=5), "AogoWimsy could not sort a MESSAGE_CREATE event: KeyError: 'author'")
+        number = self.fake.say(GENERAL, FRIEND, 'still hearing', mentions=[BOT])
+        ear.feed('MESSAGE_CREATE', self.fake.event(GENERAL, number))
+        self.assertEqual(pushes.get(timeout=5), 'still hearing')
+        stop.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+
+
+def ws_frame(opcode, payload, fin=True):
+    """a frame as a server sends it: never masked"""
+    size = len(payload)
+    head = bytes([(0x80 if fin else 0) | opcode])
+    if size < 126:
+        head += bytes([size])
+    elif size < 1 << 16:
+        head += bytes([126]) + size.to_bytes(2, 'big')
+    else:
+        head += bytes([127]) + size.to_bytes(8, 'big')
+    return head + payload
+
+
+class FakeGateway:
+    """Discord's gateway on 127.0.0.1: hello, READY on identify, RESUMED on resume, heartbeat ACKs unless told not to;
+    each frame the client sends is kept, and checked masked"""
+
+    def __init__(self, interval=0.05, accept_right=True):
+        self.listener = socket.create_server(('127.0.0.1', 0))
+        self.url = f'ws://127.0.0.1:{self.listener.getsockname()[1]}'
+        self.interval, self.accept_right, self.ack = interval, accept_right, True
+        self.got = queue.Queue()  # (connection, what the client sent)
+        self.connections, self.paths, self.seq, self.unmasked = [], [], 0, 0
+        threading.Thread(target=self.accept, daemon=True).start()
+
+    def shut(self):
+        self.listener.close()
+        for conn in self.connections:
+            conn.close()
+
+    def accept(self):
+        while True:
+            try:
+                conn, _ = self.listener.accept()
+            except OSError:
+                return
+            self.connections.append(conn)
+            threading.Thread(target=self.serve, args=(conn, len(self.connections) - 1), daemon=True).start()
+
+    def send(self, payload, conn=None, opcode=1):
+        (conn or self.connections[-1]).sendall(
+            ws_frame(opcode, payload if isinstance(payload, bytes) else json.dumps(payload).encode())
+        )
+
+    def dispatch(self, kind, data, conn=None):
+        self.seq += 1
+        self.send({'op': 0, 't': kind, 's': self.seq, 'd': data}, conn)
+
+    def close_with(self, code):
+        self.send(code.to_bytes(2, 'big') + b'bye', opcode=8)
+
+    def serve(self, conn, number):
+        try:
+            head = b''
+            while b'\r\n\r\n' not in head:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                head += chunk
+            lines = head.decode().split('\r\n')
+            self.paths.append(lines[0].split(' ')[1])
+            key = next(x.split(':', 1)[1].strip() for x in lines if x.lower().startswith('sec-websocket-key:'))
+            accept = base64.b64encode(hashlib.sha1((key + aw.WS_GUID).encode()).digest()).decode()
+            if not self.accept_right:
+                accept = 'wrong'
+            conn.sendall(
+                f'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                f'Sec-WebSocket-Accept: {accept}\r\n\r\n'.encode()
+            )
+            self.send({'op': 10, 'd': {'heartbeat_interval': self.interval * 1000}}, conn)
+            buffer = b''
+            while True:
+                while True:
+                    frame = self.parse(buffer)
+                    if frame:
+                        break
+                    chunk = conn.recv(65536)
+                    if not chunk:
+                        return
+                    buffer += chunk
+                opcode, payload, masked, buffer = frame
+                if not masked:
+                    self.unmasked += 1
+                elif opcode == 8:
+                    self.got.put((number, {'close': int.from_bytes(payload[:2], 'big')}))
+                    conn.close()
+                    return
+                elif opcode == 10:
+                    self.got.put((number, {'pong': payload}))
+                else:
+                    message = json.loads(payload)
+                    self.got.put((number, message))
+                    if message['op'] == 1 and self.ack:
+                        self.send({'op': 11}, conn)
+                    elif message['op'] == 2:
+                        ready = {'session_id': 'fake-session', 'resume_gateway_url': self.url, 'user': {'id': BOT}}
+                        self.dispatch('READY', ready, conn)
+                    elif message['op'] == 6:
+                        self.dispatch('RESUMED', {}, conn)
+        except OSError:
+            return
+
+    @staticmethod
+    def parse(data):
+        if len(data) < 2:
+            return None
+        opcode, masked, size, at = data[0] & 0x0F, bool(data[1] & 0x80), data[1] & 0x7F, 2
+        if size == 126:
+            size, at = int.from_bytes(data[2:4], 'big'), 4
+        elif size == 127:
+            size, at = int.from_bytes(data[2:10], 'big'), 10
+        mask = data[at : at + 4] if masked else b''
+        at += len(mask)
+        if len(data) < at + size:
+            return None
+        payload = data[at : at + size]
+        if masked:
+            payload = bytes(byte ^ mask[place % 4] for place, byte in enumerate(payload))
+        return opcode, payload, masked, data[at + size :]
+
+    def next(self, want, timeout=5.0):
+        """the next thing a connection got that want(message) takes: (connection, message)"""
+        deadline = time.monotonic() + timeout
+        while True:
+            number, message = self.got.get(timeout=max(0.01, deadline - time.monotonic()))
+            if want(message):
+                return number, message
+
+
+def op(code):
+    return lambda message: isinstance(message, dict) and message.get('op') == code
+
+
+class GatewayClient(WithDiscord):
+    """aogowimsy's Gateway and WebSocket against FakeGateway; the REST /gateway/bot gives its url"""
+
+    def setUp(self):
+        super().setUp()
+        self.begin()
+
+    def begin(self, interval=0.05):
+        """a fake gateway beating every interval seconds, and a client on it in a thread of its own"""
+        if getattr(self, 'thread', None):
+            self.stop.set()
+            self.thread.join(5)
+        self.gateway = FakeGateway(interval)
+        self.addCleanup(self.gateway.shut)
+        self.fake.gateway_url = self.gateway.url
+        self.heard, self.reports, self.stop = queue.Queue(), queue.Queue(), threading.Event()
+        self.client = aw.Gateway(
+            TOKEN,
+            self.bot.discord,
+            lambda kind, data: self.heard.put((kind, data)),
+            lambda kind, text: self.reports.put((kind, text)),
+            self.stop,
+            rng=lambda: 0.5,
+            backoff=(0.01, 0.05),
+        )
+        self.thread = aw.started(self.client.run)
+        self.addCleanup(self.thread.join, 5)
+        self.addCleanup(self.stop.set)
+
+    def kind(self, want, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while True:
+            kind, data = self.heard.get(timeout=max(0.01, deadline - time.monotonic()))
+            if kind == want:
+                return data
+
+    def test_identify_with_its_intents_then_heartbeats_carrying_the_last_seq(self):
+        _, identify = self.gateway.next(op(2))
+        self.assertEqual(identify['d']['token'], TOKEN)
+        self.assertEqual(identify['d']['intents'], 38401)
+        self.assertEqual(aw.INTENTS, 1 + 512 + 1024 + 4096 + 32768)
+        self.assertEqual(identify['d']['properties']['browser'], 'aogowimsy')
+        self.assertEqual(self.kind('READY')['session_id'], 'fake-session')
+        self.gateway.dispatch('MESSAGE_CREATE', {'id': '1', 'content': 'x'})
+        self.gateway.seq = 41
+        self.gateway.dispatch('MESSAGE_CREATE', {'id': '2', 'content': 'y'})
+        self.assertEqual(self.kind('MESSAGE_CREATE')['id'], '1')
+        self.gateway.next(lambda m: op(1)(m) and m['d'] == 42)
+        self.assertEqual(self.gateway.paths[0], '/?v=10&encoding=json')
+        self.assertEqual(self.client.seq, 42)
+        self.assertEqual(self.gateway.unmasked, 0)
+
+    def test_a_heartbeat_asked_for_goes_at_once(self):
+        self.begin(interval=30)  # its own first beat would come in 15 s
+        self.gateway.next(op(2))
+        self.kind('READY')
+        self.gateway.send({'op': 1, 'd': None})
+        self.assertEqual(self.gateway.next(op(1), timeout=2)[1], {'op': 1, 'd': 1})
+
+    def test_a_missed_ack_reconnects_and_resumes_the_session(self):
+        self.gateway.next(op(2))
+        self.kind('READY')
+        self.gateway.ack = False
+        number, closed = self.gateway.next(lambda m: isinstance(m, dict) and 'close' in m)
+        self.assertEqual((number, closed['close']), (0, 4000))
+        number, resume = self.gateway.next(op(6))
+        self.assertEqual(number, 1)
+        self.assertEqual((resume['d']['session_id'], resume['d']['token']), ('fake-session', TOKEN))
+        self.assertEqual(resume['d']['seq'], 1)
+        self.kind('RESUMED')
+
+    def test_reconnect_resumes_an_invalid_session_identifies_again(self):
+        self.gateway.next(op(2))
+        self.kind('READY')
+        self.gateway.send({'op': 7, 'd': None})
+        self.assertEqual(self.gateway.next(op(6))[0], 1)
+        self.kind('RESUMED')
+        self.gateway.send({'op': 9, 'd': False})
+        self.assertEqual(self.gateway.next(op(2))[0], 2)
+        self.kind('READY')
+        self.gateway.close_with(4009)
+        self.assertEqual(self.gateway.next(op(2))[0], 3)
+
+    def test_a_close_discord_takes_no_new_try_after_stops_it_saying_why(self):
+        self.gateway.next(op(2))
+        self.kind('READY')
+        self.gateway.close_with(4014)
+        kind, text = self.reports.get(timeout=5)
+        self.assertEqual(kind, 'stopped')
+        self.assertIn(
+            'Discord closed the gateway with 4014 (bye): disallowed intents: turn on Message Content Intent', text
+        )
+        self.thread.join(5)
+        self.assertFalse(self.thread.is_alive())
+        self.assertEqual(len(self.gateway.connections), 1)
+
+    def test_a_bad_token_stops_it(self):
+        self.gateway.next(op(2))
+        self.gateway.close_with(4004)
+        self.assertIn(
+            "4004 (bye): authentication failed: AOGOWIMSY_TOKEN is not the bot's token", self.reports.get(timeout=5)[1]
+        )
+
+    def test_a_ping_gets_its_pong_and_a_message_in_two_frames_comes_whole(self):
+        self.gateway.next(op(2))
+        self.kind('READY')
+        self.gateway.send(b'are you there', opcode=9)
+        self.assertEqual(
+            self.gateway.next(lambda m: isinstance(m, dict) and 'pong' in m)[1], {'pong': b'are you there'}
+        )
+        whole = json.dumps({'op': 0, 't': 'MESSAGE_CREATE', 's': 9, 'd': {'id': '3', 'content': 'two halves'}}).encode()
+        conn = self.gateway.connections[-1]
+        conn.sendall(ws_frame(1, whole[:20], fin=False) + ws_frame(0, whole[20:]))
+        self.assertEqual(self.kind('MESSAGE_CREATE')['content'], 'two halves')
+
+    def test_a_stop_closes_with_1000(self):
+        self.gateway.next(op(2))
+        self.kind('READY')
+        self.stop.set()
+        self.assertEqual(self.gateway.next(lambda m: isinstance(m, dict) and 'close' in m)[1], {'close': 1000})
+
+
+class GatewayRefusals(WithDiscord):
+    def test_a_gateway_url_that_is_not_wss_is_refused_naming_it(self):
+        with self.assertRaisesRegex(aw.DiscordError, 'the gateway url "ws://example.com/" is not wss://'):
+            aw.WebSocket('ws://example.com/')
+        with self.assertRaisesRegex(aw.DiscordError, 'is not wss://'):
+            aw.WebSocket('http://127.0.0.1:9/')
+
+    def test_a_wrong_handshake_answer_is_refused(self):
+        gateway = FakeGateway(accept_right=False)
+        self.addCleanup(gateway.shut)
+        with self.assertRaisesRegex(ConnectionError, 'Sec-WebSocket-Accept "wrong", not '):
+            aw.WebSocket(gateway.url + '/?v=10&encoding=json')
+
+    def test_a_401_for_the_gateway_url_stops_it(self):
+        self.fake.fail[('GET', '/gateway/bot')] = (401, {'message': '401: Unauthorized', 'code': 0})
+        reports, stop = [], threading.Event()
+        self.addCleanup(stop.set)
+        report = lambda kind, text: reports.append((kind, text))
+        client = aw.Gateway(TOKEN, self.bot.discord, None, report, stop, rng=lambda: 0.5, backoff=(0.01, 0.05))
+        thread = aw.started(client.run)
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            reports, [('stopped', "Discord answered 401 to GET /gateway/bot: AOGOWIMSY_TOKEN is not the bot's token")]
+        )
+
+    def test_from_the_gateway_to_the_session_end_to_end(self):
+        gateway = FakeGateway()
+        self.addCleanup(gateway.shut)
+        self.fake.gateway_url = gateway.url
+        stop, pushes = threading.Event(), queue.Queue()
+        self.addCleanup(stop.set)
+        ear = aw.Ear(self.bot, lambda text, meta: pushes.put((text, meta)), stop)
+        client = aw.Gateway(TOKEN, self.bot.discord, ear.feed, ear.report, stop, rng=lambda: 0.5, backoff=(0.01, 0.05))
+        threads = [aw.started(ear.run), aw.started(client.run)]
+        gateway.next(op(2))
+        number = self.fake.say(GENERAL, OWNER, 'to aogo, live', mentions=[BOT])
+        gateway.dispatch('MESSAGE_CREATE', self.fake.event(GENERAL, number))
+        text, meta = pushes.get(timeout=5)
+        self.assertEqual((text, meta['message_id'], meta['kind']), ('to aogo, live', number, 'message'))
+        stop.set()
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
+
+
+class Writer(unittest.TestCase):
+    def test_lines_from_many_threads_never_mix(self):
+        class Slow:
+            """a stream that writes a line in two halves, with time for another thread between them"""
+
+            def __init__(self):
+                self.data = bytearray()
+
+            def write(self, line):
+                half = len(line) // 2
+                self.data += line[:half]
+                time.sleep(0.002)
+                self.data += line[half:]
+
+            def flush(self):
+                pass
+
+        stream = Slow()
+        write = aw.LineWriter(stream)
+
+        def many(who):
+            for n in range(25):
+                write({'jsonrpc': '2.0', 'method': 'notifications/claude/channel', 'params': {'content': f'{who} {n}'}})
+
+        threads = [aw.started(lambda who=who: many(who)) for who in 'abcd']
+        for thread in threads:
+            thread.join(10)
+        lines = bytes(stream.data).split(b'\n')
+        self.assertEqual(lines[-1], b'')
+        self.assertEqual(len([json.loads(line) for line in lines[:-1]]), 100)
+
+
 class Stdio(unittest.TestCase):
-    """the real program, as Claude Code starts it: a line a message on stdin and stdout, logs on stderr"""
+    """the real program, as Claude Code starts it: a line a message on stdin and stdout, logs on stderr. It is never
+    told initialized here, so it never reaches for Discord's gateway"""
 
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
@@ -807,11 +1423,10 @@ class Stdio(unittest.TestCase):
 
     def test_the_handshake_tools_list_and_a_tool_call_through_a_subprocess(self):
         proc = self.start('--env', self.env)
-        params = {'protocolVersion': '2025-11-25', 'capabilities': {}, 'clientInfo': {'name': 'test', 'version': '1'}}
-        answer = self.exchange(proc, {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': params})
+        answer = self.exchange(proc, {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': INITIALIZE})
         self.assertEqual((answer['id'], answer['result']['protocolVersion']), (1, '2025-11-25'))
+        self.assertEqual(answer['result']['capabilities'], {'tools': {}, 'experimental': {'claude/channel': {}}})
         self.assertIn(f'channels {GENERAL}, {HELP} and their threads', answer['result']['instructions'])
-        proc.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
         answer = self.exchange(proc, {'jsonrpc': '2.0', 'id': 'list', 'method': 'tools/list'})
         self.assertEqual(answer, {'jsonrpc': '2.0', 'id': 'list', 'result': {'tools': aw.TOOLS}})
         self.assertEqual(self.exchange(proc, {'jsonrpc': '2.0', 'id': 3, 'method': 'ping'})['result'], {})
@@ -828,16 +1443,16 @@ class Stdio(unittest.TestCase):
         self.assertIn(f'aogowimsy: up: owner {OWNER}, 1 users, 2 channels', errors)
         self.assertIn('aogowimsy: discord_read failed: channel is "general"', errors)
 
-    def test_2026_07_28_discovery_then_tools_list(self):
+    def test_a_2026_07_28_client_gets_method_not_found_for_discovery(self):
         proc = self.start('--env', self.env)
+        meta = {
+            'io.modelcontextprotocol/protocolVersion': '2026-07-28',
+            'io.modelcontextprotocol/clientCapabilities': {},
+        }
         answer = self.exchange(
-            proc, {'jsonrpc': '2.0', 'id': 1, 'method': 'server/discover', 'params': {'_meta': META}}
+            proc, {'jsonrpc': '2.0', 'id': 1, 'method': 'server/discover', 'params': {'_meta': meta}}
         )
-        self.assertEqual(
-            (answer['result']['resultType'], answer['result']['supportedVersions'][0]), ('complete', '2026-07-28')
-        )
-        answer = self.exchange(proc, {'jsonrpc': '2.0', 'id': 2, 'method': 'tools/list', 'params': {'_meta': META}})
-        self.assertEqual(len(answer['result']['tools']), 4)
+        self.assertEqual(answer['error']['code'], -32601)
         self.finish(proc)
 
     def test_a_bad_env_file_or_option_stops_it_naming_what(self):

@@ -3,26 +3,40 @@
 
     aogowimsy.py [--env FILE]       FILE: ~/.config/aogowimsy/aogowimsy.env when not given; mode 600 or stricter
 
-A local MCP server that Claude Code starts and talks to on stdin and stdout, a JSON-RPC 2.0 message a line: protocol
-revision 2026-07-28 (each request carries its version in _meta; server/discover) and, through initialize, 2025-11-25
-back to 2024-11-05. Its tools:
+A local MCP server that Claude Code starts and talks to on stdin and stdout, a JSON-RPC 2.0 message a line, through
+the initialize handshake (protocol 2025-11-25 back to 2024-11-05): Claude Code registers no channel on revision
+2026-07-28, which cannot carry its messages. Its tools:
 
     discord_post         a draft in the owner's DMs with AogoWimsy, with a check mark and a cross: only the owner's
                          check mark posts it, as it is, pinging no one
     discord_post_status  the same wait, on a draft that came back still waiting
     discord_read         a channel's messages: the owner's, the listed users' and AogoWimsy's own; others only counted
-    discord_wait         the first message after an id from the owner or a listed user
+    discord_wait         the first message after an id from the owner or a listed user, as the gateway hears it
 
-It speaks Discord's REST API v10 with urllib, no gateway. It posts only in the channels AOGOWIMSY_CHANNELS lists and
-their threads, and reads those and the owner's DMs with it. The owner's check mark is the only way a text gets out:
-no setting turns it off. Nothing is stored: a draft waiting is a message in the owner's DMs, read again at each look,
-and stderr says a tool ran or failed, never what was said.
+It is also a Claude Code channel (experimental capability claude/channel): once the session is up it stays on
+Discord's gateway, and pushes into the session, as notifications/claude/channel, each message addressed to AogoWimsy
+(a mention, or a reply to one of its messages) from the owner or a listed user, their DMs with it, a stranger's
+addressed message the owner let through with his WIMSY reaction, and only the name of a stranger who wrote in DMs.
+The owner's reply that mentions AogoWimsy lets the message he replied to through too, and carries it whole.
+
+Discord's REST API v10 (urllib) reads and posts; its gateway (a WebSocket of its own, ssl and socket) hears. It works
+in the channels AOGOWIMSY_CHANNELS lists and their threads, or in every one Discord lets it see when it lists none,
+and in the owner's DMs with it. The owner's check mark is the only way a text gets out: no setting turns it off.
+Nothing is stored: a draft waiting is a message in the owner's DMs, read again at each look, and stderr says what
+ran or failed, never what was said nor who said it.
 """
 
 import argparse
+import base64
+import contextlib
+import hashlib
 import json
 import os
+import queue
+import random
 import re
+import socket
+import ssl
 import stat
 import sys
 import threading
@@ -34,31 +48,51 @@ import urllib.request
 from pathlib import Path
 from typing import NamedTuple
 
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 SERVER_INFO = {'name': 'aogowimsy', 'title': 'AogoWimsy', 'version': VERSION}
 API = 'https://discord.com/api/v10'
 AGENT = f'DiscordBot (https://github.com/scarletnx/discord-bots, {VERSION})'
 ENV = '~/.config/aogowimsy/aogowimsy.env'
-KEYS = ('AOGOWIMSY_TOKEN', 'AOGOWIMSY_OWNER', 'AOGOWIMSY_USERS', 'AOGOWIMSY_CHANNELS')
+NEEDED = ('AOGOWIMSY_TOKEN', 'AOGOWIMSY_OWNER', 'AOGOWIMSY_USERS')
+KEYS = (*NEEDED, 'AOGOWIMSY_CHANNELS')
 LIMIT = 2000  # a Discord message's letters
-POLL = 3.0  # seconds between two looks at a draft's reactions or at a channel
+POLL = 3.0  # seconds between two looks at a draft's reactions
+LOOK = 1.0  # seconds a wait sleeps at most before looking again at what the gateway brought
 MOST_WAIT = 3600  # seconds a tool waits at most
 PAGE = 100  # messages one GET gives at most
 TRIES = 5  # a request answered 429 this many times in a row is an error
 MOST_RETRY = 60.0  # seconds a 429 may ask to wait
-YES, NO = '\u2705', '\u274c'
+YES, NO = chr(0x2705), chr(0x274C)
+# The owner's custom emoji (DraVee, 2026-10-21: "se alguem te citar, eu posso (somente eu) so responder com um
+# emoji"): his reaction with it, and only his, lets one stranger's message addressed to AogoWimsy reach the session.
+# Matched by its name; a constant, not a setting.
+WIMSY = 'wimsytetoutau'
 DM, THREADS, REPLY = 1, (10, 11, 12), 19  # channel types (a DM; the three threads) and a reply's message type
 SNOWFLAKE = re.compile(r'[0-9]{17,20}')
 TOKEN_LETTER = re.compile(r'[A-Za-z0-9._-]')
 WAITING = re.compile(r'(waiting|sending|not sent): to ([0-9]{17,20})(?: replying to ([0-9]{17,20}))?')
 SENT = re.compile(r'sent: ([0-9]{17,20}|@me)/([0-9]{17,20})/([0-9]{17,20})')
-MODERN = ('2026-07-28',)  # versions that carry their version and the client's capabilities in each request's _meta
-LEGACY = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')  # versions that open with initialize
-METHODS = ('initialize', 'ping', 'server/discover', 'tools/list', 'tools/call')
-VERSION_KEY = 'io.modelcontextprotocol/protocolVersion'
-CAPABILITIES_KEY = 'io.modelcontextprotocol/clientCapabilities'
-SERVER_INFO_KEY = 'io.modelcontextprotocol/serverInfo'
-TTL_MS = 3_600_000  # the tool list and the discovery answer change only with a new AogoWimsy
+VERSIONS = ('2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05')  # the initialize handshake's
+METHODS = ('initialize', 'ping', 'tools/list', 'tools/call')
+CAPABILITIES = {'tools': {}, 'experimental': {'claude/channel': {}}}
+CHANNEL_PUSH = 'notifications/claude/channel'
+# The gateway's intents: GUILDS (1), GUILD_MESSAGES (512), GUILD_MESSAGE_REACTIONS (1024), DIRECT_MESSAGES (4096),
+# MESSAGE_CONTENT (32768, privileged: the Developer Portal's Message Content Intent)
+INTENTS = 1 | 1 << 9 | 1 << 10 | 1 << 12 | 1 << 15
+GATEWAY_STOPS = {  # close codes after which Discord takes no new try: AogoWimsy stops hearing and says why
+    4004: "authentication failed: AOGOWIMSY_TOKEN is not the bot's token",
+    4010: 'invalid shard',
+    4011: 'sharding required',
+    4012: 'invalid API version',
+    4013: 'invalid intents',
+    4014: 'disallowed intents: turn on Message Content Intent (Bot, Privileged Gateway Intents) in the Developer '
+    'Portal',
+}
+GATEWAY_FRESH = (4007, 4009)  # close codes after which the session cannot resume: identify again
+HELLO_WAIT = 30.0  # seconds the gateway has to say hello
+STOP_LOOK = 0.5  # seconds the gateway reads at most before looking whether AogoWimsy stops
+MOST_FRAME = 64 << 20  # bytes a gateway message may have
+WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'  # RFC 6455's, for Sec-WebSocket-Accept
 
 
 class Refused(Exception):
@@ -68,16 +102,28 @@ class Refused(Exception):
 class DiscordError(Exception):
     """Discord said no, or could not be reached: the message says what it answered"""
 
+    def __init__(self, text, status=None):
+        super().__init__(text)
+        self.status = status
+
 
 class Cancelled(Exception):
     """the client cancelled the request, or AogoWimsy is stopping: the request gets no answer"""
+
+
+class Drop(Exception):
+    """a gateway connection ended: AogoWimsy connects again"""
+
+
+class Stopped(Exception):
+    """the gateway cannot go on: Discord takes no new try"""
 
 
 class Settings(NamedTuple):
     token: str
     owner: str
     users: frozenset
-    channels: frozenset
+    channels: frozenset | None  # None: every channel Discord lets the bot see
 
 
 def shown(value):
@@ -134,9 +180,13 @@ def read_settings(path):
         if key in values:
             raise Refused(f'{path} line {number}: {key} again, set on line {lines[key]} already')
         values[key], lines[key] = value.strip(), number
-    for key in KEYS:
+    for key in NEEDED:
         if not values.get(key):
             raise Refused(f'{path}: {key} is {"empty" if key in values else "missing"}, and AogoWimsy needs it')
+    if values.get('AOGOWIMSY_CHANNELS') == '':
+        raise Refused(
+            f'{path}: AOGOWIMSY_CHANNELS is empty: list id,id, or take the line out for every channel the bot can see'
+        )
     token = values['AOGOWIMSY_TOKEN']
     for place, letter in enumerate(token, 1):
         if not TOKEN_LETTER.fullmatch(letter):
@@ -145,7 +195,10 @@ def read_settings(path):
                 'digits, ".", "_" and "-"'
             )
     owner = snowflake(values['AOGOWIMSY_OWNER'], f'{path}: AOGOWIMSY_OWNER')
-    users, channels = (id_list(path, key, values[key]) for key in ('AOGOWIMSY_USERS', 'AOGOWIMSY_CHANNELS'))
+    users = id_list(path, 'AOGOWIMSY_USERS', values['AOGOWIMSY_USERS'])
+    channels = (
+        id_list(path, 'AOGOWIMSY_CHANNELS', values['AOGOWIMSY_CHANNELS']) if 'AOGOWIMSY_CHANNELS' in values else None
+    )
     return Settings(token, owner, users, channels)
 
 
@@ -163,14 +216,29 @@ def by_id(ids):
     return ', '.join(sorted(ids, key=int))
 
 
+def scope(settings):
+    """where AogoWimsy reads and posts, in words"""
+    if settings.channels is None:
+        return 'every channel and thread Discord lets it see (AOGOWIMSY_CHANNELS lists none)'
+    return f'channels {by_id(settings.channels)} and their threads'
+
+
 def instructions(settings):
     """what the server tells the session about itself"""
     return (
         f'AogoWimsy is Aogo on Discord. Every post is a draft its owner (Discord user {settings.owner}) answers in '
-        f'their DMs with AogoWimsy: {YES} posts it as it is, {NO} or no answer posts nothing. It posts in channels '
-        f"{by_id(settings.channels)} and their threads; it reads those and the owner's DMs with it. Of what it "
-        f"reads, only the owner's messages, those of users {by_id(settings.users)} and its own reach you; others' "
-        'are only counted.'
+        f'their DMs with AogoWimsy: {YES} posts it as it is, {NO} or no answer posts nothing. It reads and posts in '
+        f"{scope(settings)}, and reads the owner's DMs with it. Of what it reads, only the owner's messages, those "
+        f'of users {by_id(settings.users)} and its own reach you; the others are counted, but for a message the '
+        f'owner let through: one addressed to AogoWimsy (a mention, or a reply to one of its messages) that he put '
+        f'his :{WIMSY}: reaction on, or any he replied to while mentioning AogoWimsy. While the session runs, '
+        'Discord comes in as <channel> events: kind="message" (from the owner or a listed user: a message addressed '
+        'to AogoWimsy, or their DM; when the owner replied to someone while mentioning AogoWimsy, the text ends with '
+        'the message he replied to, and quoted_author and quoted_author_id name its author), kind="approved" (a '
+        "stranger's addressed message the owner let through with the reaction), each with author, author_id, "
+        'channel, message_id and reply_to; kind="dm" (someone else wrote to AogoWimsy in DMs: their name only), '
+        'kind="error" or "notice" (the gateway). Answer in Discord with discord_post, reply_to the message_id: it '
+        f"still waits for the owner's {YES}."
     )
 
 
@@ -181,7 +249,7 @@ class Clock:
         return time.monotonic()
 
     def wait(self, seconds, event=None):
-        """True when event was set: the request was cancelled"""
+        """True when event was set during the wait"""
         if event is None:
             time.sleep(seconds)
             return False
@@ -238,21 +306,25 @@ class Discord:
                 with error:
                     said = answer_of(error.read())
                 if error.code != 429:
-                    raise DiscordError(f'Discord answered {error.code} to {method} {path}: {reason(said)}') from None
+                    raise DiscordError(
+                        f'Discord answered {error.code} to {method} {path}: {reason(said)}', error.code
+                    ) from None
                 retry = said.get('retry_after') if isinstance(said, dict) else None
                 retry = retry if isinstance(retry, (int, float)) else error.headers.get('Retry-After')
                 try:
                     retry = max(0.0, float(retry))
                 except (TypeError, ValueError):
-                    raise DiscordError(f'Discord answered 429 to {method} {path} with no retry_after') from None
+                    raise DiscordError(f'Discord answered 429 to {method} {path} with no retry_after', 429) from None
                 if retry > MOST_RETRY:
                     raise DiscordError(
                         f'Discord answered 429 to {method} {path}, asking to wait {retry} s: more than the '
-                        f'{MOST_RETRY:.0f} s AogoWimsy waits for one'
+                        f'{MOST_RETRY:.0f} s AogoWimsy waits for one',
+                        429,
                     )
                 if attempt == TRIES:
                     raise DiscordError(
-                        f'Discord answered 429 to {method} {path} {TRIES} times, the last asking to wait {retry} s'
+                        f'Discord answered 429 to {method} {path} {TRIES} times, the last asking to wait {retry} s',
+                        429,
                     )
                 self.clock.wait(retry)
                 continue
@@ -269,7 +341,7 @@ def link(guild, channel, message):
     return f'https://discord.com/channels/{guild or "@me"}/{channel}/{message}'
 
 
-def view(message):
+def view(message, approved=False):
     """a message as the session gets it"""
     author = message['author']
     reference = message.get('message_reference') or {}
@@ -281,7 +353,28 @@ def view(message):
         'text': message.get('content', ''),
         'reply_to': reference.get('message_id') if message.get('type') == REPLY else None,
         'attachments': [item.get('filename') for item in message.get('attachments', [])],
+        'approved': approved,
     }
+
+
+def mentions_me(message, me):
+    return any(user.get('id') == me for user in message.get('mentions') or [])
+
+
+def addressed(message, me):
+    """whether a message mentions AogoWimsy or replies to one of its messages"""
+    if mentions_me(message, me):
+        return True
+    answered = message.get('referenced_message') or {}
+    return message.get('type') == REPLY and (answered.get('author') or {}).get('id') == me
+
+
+def quoting(message, owner, me):
+    """the id of the message the owner replied to while mentioning AogoWimsy, which lets it through as his WIMSY
+    does (DraVee, 2026-10-21: "e literalmente eu quotando outra pessoa"); None for any other message"""
+    if message['author']['id'] != owner or message.get('type') != REPLY or not mentions_me(message, me):
+        return None
+    return (message.get('message_reference') or {}).get('message_id')
 
 
 def footer(kind, channel, reply_to):
@@ -340,12 +433,77 @@ def kind_of(value):
     return {bool: 'boolean', int: 'number', float: 'number', list: 'array', dict: 'object'}.get(type(value), 'value')
 
 
+class Inbox:
+    """the messages the gateway heard in one channel, for one wait; gap: some may have gone unheard"""
+
+    def __init__(self, channel):
+        self.channel, self.ready, self.guard = channel, threading.Event(), threading.Lock()
+        self.pending, self.gap = [], True  # a new inbox reads what came before it, once
+
+    def put(self, message):
+        with self.guard:
+            self.pending.append(message)
+            self.ready.set()
+
+    def lost(self):
+        with self.guard:
+            self.gap = True
+            self.ready.set()
+
+    def take(self):
+        with self.guard:
+            items, gap = self.pending, self.gap
+            self.pending, self.gap = [], False
+            self.ready.clear()
+        return items, gap
+
+
+class Hub:
+    """the gateway's messages, handed to the waits listening on their channel"""
+
+    def __init__(self):
+        self.guard, self.inboxes, self.stopped = threading.Lock(), set(), None
+
+    @contextlib.contextmanager
+    def listening(self, channel):
+        inbox = Inbox(channel)
+        with self.guard:
+            self.inboxes.add(inbox)
+        try:
+            yield inbox
+        finally:
+            with self.guard:
+                self.inboxes.discard(inbox)
+
+    def deliver(self, message):
+        with self.guard:
+            inboxes = [inbox for inbox in self.inboxes if inbox.channel == message.get('channel_id')]
+        for inbox in inboxes:
+            inbox.put(message)
+
+    def gap(self):
+        """a new gateway session: what came while none was up went unheard"""
+        with self.guard:
+            inboxes = list(self.inboxes)
+        for inbox in inboxes:
+            inbox.lost()
+
+    def stop(self, why):
+        self.stopped = why
+        with self.guard:
+            inboxes = list(self.inboxes)
+        for inbox in inboxes:
+            inbox.ready.set()
+
+
 class AogoWimsy:
     """the tools: Discord with the settings' channels, people and owner"""
 
-    def __init__(self, settings, discord, clock):
+    def __init__(self, settings, discord, clock, hub=None):
         self.settings, self.discord, self.clock = settings, discord, clock
+        self.hub = hub or Hub()
         self.known = {}  # its own user id and the owner's DM channel, asked once
+        self.approved = set()  # the messages the owner let through while the gateway heard: their ids, in memory only
         self.guard = threading.Lock()
         self.drafts = {}  # a lock a draft: one look at a time, so no draft is posted twice
 
@@ -362,12 +520,27 @@ class AogoWimsy:
     def people(self):
         return self.settings.users | {self.settings.owner}
 
+    def authors(self, value):
+        """the ids `from` names, each the owner or a listed user; None when it names none"""
+        if value is None:
+            return None
+        owner, users = self.settings.owner, by_id(self.settings.users)
+        if not isinstance(value, list) or not value:
+            raise Refused(
+                f'from is {shown(value)}: a list of 1 or more ids, of the owner ({owner}) or listed users ({users})'
+            )
+        for place, item in enumerate(value, 1):
+            snowflake(item, f'from item {place}')
+            if item not in self.people():
+                raise Refused(f'from item {place} is {item}, neither the owner ({owner}) nor a listed user ({users})')
+        return frozenset(value)
+
     def where(self, channel, reading):
-        """the channel AogoWimsy may post in, or read: listed, a thread of a listed one, or (reading) the owner's
-        DMs; else Refused naming it and those it may"""
+        """the channel AogoWimsy may post in, or read: listed, a thread of a listed one, any Discord lets it see when
+        none is listed, or (reading) the owner's DMs; else Refused naming it and those it may"""
         listed = self.settings.channels
-        if channel in listed:
-            return self.discord('GET', f'/channels/{channel}')
+        if listed is None or channel in listed:
+            return self.discord('GET', f'/channels/{channel}')  # Discord's 403 or 404 names it
         if reading and channel == self.dm():
             return {'id': channel, 'type': DM}
         may = f'AOGOWIMSY_CHANNELS lists {by_id(listed)}, and their threads'
@@ -463,6 +636,11 @@ class AogoWimsy:
                 raise Cancelled
             progress(self.clock.now() - start, wait, f"waiting for the owner's answer to draft {draft}")
 
+    def reactors(self, channel, message, emoji):
+        """the ids of who reacted to a message with an emoji (a name, or name:id for a custom one)"""
+        path = f'/channels/{channel}/messages/{message}/reactions/{urllib.parse.quote(emoji)}'
+        return {user.get('id') for user in self.discord('GET', path, limit=PAGE)}
+
     def answer(self, dm, message):
         """whether the owner reacted with the check mark, and with the cross: another person's reaction, or
         AogoWimsy's own, counts for nothing"""
@@ -472,10 +650,18 @@ class AogoWimsy:
             if emoji.get('id') is None and emoji.get('name') in (YES, NO):
                 others = reaction.get('count', 0) - (1 if reaction.get('me') else 0)
                 if others > 0:
-                    path = f'/channels/{dm}/messages/{message["id"]}/reactions/{urllib.parse.quote(emoji["name"])}'
-                    users = self.discord('GET', path, limit=PAGE)
-                    said[emoji['name']] = any(user.get('id') == self.settings.owner for user in users)
+                    said[emoji['name']] = self.settings.owner in self.reactors(dm, message['id'], emoji['name'])
         return said.get(YES, False), said.get(NO, False)
+
+    def let_through(self, channel, message, me):
+        """whether a stranger's message is addressed to AogoWimsy and carries the owner's WIMSY reaction"""
+        if not addressed(message, me):
+            return False
+        for reaction in message.get('reactions') or []:
+            emoji = reaction.get('emoji') or {}
+            if emoji.get('name') == WIMSY and emoji.get('id'):
+                return self.settings.owner in self.reactors(channel, message['id'], f'{WIMSY}:{emoji["id"]}')
+        return False
 
     def edit(self, dm, draft, card):
         self.discord('PATCH', f'/channels/{dm}/messages/{draft}', {'embeds': [card]})
@@ -509,55 +695,518 @@ class AogoWimsy:
         return {'status': 'sent', 'link': where_to, 'message': posted, 'channel': channel, 'draft': draft}
 
     def read(self, args, cancelled, progress):
-        take(args, 'discord_read', ('channel',), ('after', 'limit'))
+        take(args, 'discord_read', ('channel',), ('after', 'limit', 'from'))
         channel = snowflake(args['channel'], 'channel')
         after = None if args.get('after') is None else snowflake(args['after'], 'after')
         limit = whole(args.get('limit'), 'limit', 50, 1, PAGE)
+        named = self.authors(args.get('from'))
         self.where(channel, reading=True)
         query = {'limit': limit} | ({'after': after} if after else {})
         page = sorted(self.discord('GET', f'/channels/{channel}/messages', **query), key=lambda m: int(m['id']))
-        heard = self.people() | {self.me()}
-        kept = [view(m) for m in page if m['author']['id'] in heard]
+        me = self.me()
+        heard = named if named is not None else self.people() | {me}
+        quoted = self.approved | {quoting(m, self.settings.owner, me) for m in page}
+        kept = []
+        for message in page:
+            author = message['author']['id']
+            if author in heard:
+                kept.append(view(message))
+            elif named is None and author != me and (message['id'] in quoted or self.let_through(channel, message, me)):
+                kept.append(view(message, approved=True))
         newest = page[-1]['id'] if page else after
         return {'channel': channel, 'messages': kept, 'left_out': len(page) - len(kept), 'after': newest}
 
+    def since(self, channel, after):
+        """every message of a channel after an id, from Discord's REST, oldest first"""
+        found = []
+        while True:
+            page = sorted(
+                self.discord('GET', f'/channels/{channel}/messages', after=after, limit=PAGE),
+                key=lambda m: int(m['id']),
+            )
+            found += page
+            if len(page) < PAGE:
+                return found
+            after = page[-1]['id']
+
     def wait_for(self, args, cancelled, progress):
-        take(args, 'discord_wait', ('channel', 'after'), ('wait',))
+        take(args, 'discord_wait', ('channel', 'after'), ('wait', 'from'))
         channel = snowflake(args['channel'], 'channel')
         after = snowflake(args['after'], 'after')
         wait = whole(args.get('wait'), 'wait', 600, 0, MOST_WAIT)
+        named = self.authors(args.get('from'))
+        who = named if named is not None else self.people()
         self.where(channel, reading=True)
-        people, me = self.people(), self.me()
+        me = self.me()
         start, left_out = self.clock.now(), 0
+        with self.hub.listening(channel) as inbox:
+            while True:
+                if self.hub.stopped:
+                    raise DiscordError(
+                        f'the gateway stopped ({self.hub.stopped}): discord_wait hears nothing; discord_read reads'
+                    )
+                items, gap = inbox.take()
+                if gap:
+                    items = items + self.since(channel, after)
+                for message in sorted({m['id']: m for m in items}.values(), key=lambda m: int(m['id'])):
+                    if int(message['id']) <= int(after):
+                        continue
+                    after = message['id']
+                    if message['author']['id'] in who:
+                        return {'channel': channel, 'message': view(message), 'left_out': left_out, 'after': after}
+                    if message['author']['id'] != me:
+                        left_out += 1
+                waited = self.clock.now() - start
+                if waited >= wait:
+                    return {
+                        'channel': channel,
+                        'message': None,
+                        'waited': round(waited),
+                        'left_out': left_out,
+                        'after': after,
+                    }
+                self.clock.wait(min(LOOK, wait - waited), inbox.ready)
+                if cancelled.is_set():
+                    raise Cancelled
+                progress(self.clock.now() - start, wait, f'waiting for a message in channel {channel}')
+
+
+class WebSocket:
+    """a WebSocket client (RFC 6455) on a socket of its own: text frames out, masked; text frames in; pings
+    answered; no extensions. wss://, or ws:// only to 127.0.0.1"""
+
+    def __init__(self, url, timeout=30.0):
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ''
+        if parts.scheme == 'wss':
+            port, tls = parts.port or 443, True
+        elif parts.scheme == 'ws' and host in ('127.0.0.1', 'localhost'):
+            port, tls = parts.port or 80, False
+        else:
+            raise DiscordError(f'the gateway url {shown(url)} is not wss://')
+        sock = socket.create_connection((host, port), timeout=timeout)
+        try:
+            if tls:
+                sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+            key = base64.b64encode(os.urandom(16)).decode()
+            target = (parts.path or '/') + (f'?{parts.query}' if parts.query else '')
+            sock.sendall(
+                f'GET {target} HTTP/1.1\r\nHost: {parts.netloc}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nUser-Agent: {AGENT}\r\n\r\n'.encode()
+            )
+            head = bytearray()
+            while b'\r\n\r\n' not in head:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    raise ConnectionError('the gateway closed the connection during the WebSocket handshake')
+                head += chunk
+                if len(head) > 65536:
+                    raise ConnectionError('the gateway answered the WebSocket handshake with more than 64 KB of head')
+            end = head.index(b'\r\n\r\n') + 4
+            lines = head[:end].decode('latin-1').split('\r\n')
+            status = lines[0].split(' ', 2)
+            if len(status) < 2 or status[1] != '101':
+                raise ConnectionError(f'the gateway answered {shown(lines[0])} to the WebSocket handshake, not 101')
+            fields = {
+                name.strip().lower(): value.strip() for name, _, value in (x.partition(':') for x in lines[1:] if x)
+            }
+            accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+            if fields.get('sec-websocket-accept') != accept:
+                raise ConnectionError(
+                    f'the gateway answered Sec-WebSocket-Accept {shown(fields.get("sec-websocket-accept"))}, '
+                    f'not {accept}'
+                )
+        except BaseException:
+            sock.close()
+            raise
+        self.sock, self.buffer, self.parts = sock, bytearray(head[end:]), None
+
+    def frame(self, opcode, payload):
+        """one frame, masked as a client's must be"""
+        header = bytearray([0x80 | opcode])
+        size = len(payload)
+        if size < 126:
+            header.append(0x80 | size)
+        elif size < 1 << 16:
+            header += bytes([0x80 | 126]) + size.to_bytes(2, 'big')
+        else:
+            header += bytes([0x80 | 127]) + size.to_bytes(8, 'big')
+        mask = os.urandom(4)
+        body = bytes(byte ^ mask[place % 4] for place, byte in enumerate(payload))
+        self.sock.settimeout(30.0)
+        self.sock.sendall(bytes(header) + mask + body)
+
+    def send(self, text):
+        self.frame(0x1, text.encode())
+
+    def close(self, code):
+        """says close with a code: 1000 ends the session; another lets it resume"""
+        try:
+            self.frame(0x8, code.to_bytes(2, 'big'))
+        except OSError as error:
+            log(f'gateway: the close frame {code} did not go out: {error}')
+
+    def shut(self):
+        self.sock.close()
+
+    def parse(self):
+        """the next whole frame in the buffer: (fin, opcode, payload), or None while it is not all there"""
+        data = self.buffer
+        if len(data) < 2:
+            return None
+        fin, opcode, size, at = bool(data[0] & 0x80), data[0] & 0x0F, data[1] & 0x7F, 2
+        if data[1] & 0x80:
+            raise ConnectionError('the gateway sent a masked frame, which a server never does')
+        if size == 126:
+            if len(data) < 4:
+                return None
+            size, at = int.from_bytes(data[2:4], 'big'), 4
+        elif size == 127:
+            if len(data) < 10:
+                return None
+            size, at = int.from_bytes(data[2:10], 'big'), 10
+        if size > MOST_FRAME:
+            raise ConnectionError(f'the gateway sent a frame of {size} bytes, more than the {MOST_FRAME} taken')
+        if len(data) < at + size:
+            return None
+        payload = bytes(data[at : at + size])
+        del data[: at + size]
+        return fin, opcode, payload
+
+    def receive(self, timeout):
+        """('text', str), ('close', code, reason), or None when nothing whole came within timeout seconds"""
+        deadline = time.monotonic() + timeout
         while True:
-            page = self.discord('GET', f'/channels/{channel}/messages', after=after, limit=PAGE)
-            for message in sorted(page, key=lambda m: int(m['id'])):
-                after = message['id']
-                if message['author']['id'] in people:
-                    return {'channel': channel, 'message': view(message), 'left_out': left_out, 'after': after}
-                if message['author']['id'] != me:
-                    left_out += 1
-            if len(page) == PAGE:
-                continue  # more came after these: read on at once
-            waited = self.clock.now() - start
-            if waited >= wait:
-                return {
-                    'channel': channel,
-                    'message': None,
-                    'waited': round(waited),
-                    'left_out': left_out,
-                    'after': after,
-                }
-            if self.clock.wait(min(POLL, wait - waited), cancelled):
-                raise Cancelled
-            progress(self.clock.now() - start, wait, f'waiting for a message in channel {channel}')
+            frame = self.parse()
+            if frame is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    return None
+                self.sock.settimeout(left)
+                try:
+                    chunk = self.sock.recv(65536)
+                except TimeoutError:
+                    return None
+                if not chunk:
+                    raise ConnectionError('the gateway closed the connection with no close frame')
+                self.buffer += chunk
+                continue
+            fin, opcode, payload = frame
+            if opcode == 0x9:
+                self.frame(0xA, payload)
+            elif opcode == 0x8:
+                code = int.from_bytes(payload[:2], 'big') if len(payload) >= 2 else 1005
+                return 'close', code, payload[2:].decode('utf-8', 'replace')
+            elif opcode in (0x1, 0x0):
+                if opcode == 0x1:
+                    self.parts = []
+                elif self.parts is None:
+                    raise ConnectionError('the gateway sent a continuation frame with no message begun')
+                self.parts.append(payload)
+                if fin:
+                    text, self.parts = b''.join(self.parts).decode('utf-8'), None
+                    return 'text', text
+            elif opcode != 0xA:
+                raise ConnectionError(f'the gateway sent a frame of opcode {opcode}, which JSON over text never uses')
+
+
+class Gateway:
+    """Discord's gateway, v10, JSON, no compression: hello, identify or resume, heartbeats and their ACKs, reconnects
+    with backoff; each event goes to hear(kind, data), and each change worth saying to report(kind, text)"""
+
+    def __init__(self, token, discord, hear, report, stop, connect=WebSocket, rng=random.random, backoff=(1.0, 60.0)):
+        self.token, self.discord, self.hear, self.report, self.stop = token, discord, hear, report, stop
+        self.connect, self.rng, self.backoff = connect, rng, backoff
+        self.session = None  # (session id, resume url), from READY
+        self.seq = None
+        self.ready = self.reported = False
+
+    def identify(self):
+        properties = {'os': sys.platform, 'browser': 'aogowimsy', 'device': 'aogowimsy'}
+        return {'op': 2, 'd': {'token': self.token, 'intents': INTENTS, 'properties': properties}}
+
+    def run(self):
+        delay, failures = self.backoff[0], 0
+        while not self.stop.is_set():
+            try:
+                self.connection()
+                return  # AogoWimsy stops
+            except Stopped as error:
+                log(f'gateway stopped: {error}')
+                self.report('stopped', str(error))
+                return
+            except Drop as error:
+                why = str(error)
+            except (OSError, DiscordError, ValueError) as error:  # ValueError: a message that is not JSON or UTF-8
+                why = f'{type(error).__name__}: {error}'
+            except Exception as error:  # noqa: BLE001 - a gateway message it did not expect: connect again, said
+                log(traceback.format_exc())
+                why = f'{type(error).__name__}: {error}'
+            if self.ready:
+                delay, failures = self.backoff[0], 0
+            else:
+                failures += 1
+            pause = delay * (0.5 + self.rng())
+            log(f'gateway: {why}; again in {pause:.1f} s')
+            if failures == 3 and not self.reported:
+                self.reported = True
+                self.report('trouble', f'{why}; it tries again, {self.backoff[1]:.0f} s apart at most')
+            delay = min(delay * 2, self.backoff[1])
+            if self.stop.wait(pause):
+                return
+
+    def connection(self):
+        """one connection: returns when AogoWimsy stops; Drop when it ends, Stopped when Discord takes no new try"""
+        self.ready = False
+        resuming = self.session is not None and self.seq is not None
+        if resuming:
+            url = self.session[1]
+        else:
+            try:
+                url = self.discord('GET', '/gateway/bot')['url']
+            except DiscordError as error:
+                if error.status == 401:
+                    raise Stopped(
+                        "Discord answered 401 to GET /gateway/bot: AOGOWIMSY_TOKEN is not the bot's token"
+                    ) from None
+                raise
+        ws = self.connect(url.rstrip('/') + '/?v=10&encoding=json')
+        try:
+            self.converse(ws, resuming)
+        finally:
+            ws.shut()
+
+    def converse(self, ws, resuming):
+        hello = ws.receive(HELLO_WAIT)
+        if hello is None or hello[0] != 'text':
+            raise Drop(
+                f'the gateway said no hello in {HELLO_WAIT:.0f} s'
+                if hello is None
+                else f'the gateway closed with {hello[1]} before its hello'
+            )
+        hello = json.loads(hello[1])
+        if hello.get('op') != 10:
+            raise Drop(f'the gateway opened with op {shown(hello.get("op"))}, not 10 (hello)')
+        interval = hello['d']['heartbeat_interval'] / 1000
+        if resuming:
+            ws.send(json.dumps({'op': 6, 'd': {'token': self.token, 'session_id': self.session[0], 'seq': self.seq}}))
+        else:
+            ws.send(json.dumps(self.identify()))
+        beat_at, acked = time.monotonic() + interval * self.rng(), True
+        while True:
+            if self.stop.is_set():
+                ws.close(1000)
+                return
+            got = ws.receive(max(0.0, min(beat_at - time.monotonic(), STOP_LOOK)))
+            if got is not None:
+                if got[0] == 'close':
+                    self.closed(got[1], got[2])
+                message = json.loads(got[1])
+                op = message.get('op')
+                if message.get('s') is not None:
+                    self.seq = message['s']
+                if op == 0:
+                    self.dispatched(message.get('t'), message.get('d') or {})
+                elif op == 1:
+                    ws.send(json.dumps({'op': 1, 'd': self.seq}))
+                elif op == 7:
+                    ws.close(4000)
+                    raise Drop('Discord asked to reconnect')
+                elif op == 9:
+                    if not message.get('d'):
+                        self.session, self.seq = None, None
+                    ws.close(4000)
+                    raise Drop(
+                        'Discord invalidated the session'
+                        + ('; it resumes' if message.get('d') else '; it identifies again')
+                    )
+                elif op == 11:
+                    acked = True
+            if time.monotonic() >= beat_at:
+                if not acked:
+                    ws.close(4000)
+                    raise Drop(f'no heartbeat ACK in {interval:.1f} s')
+                ws.send(json.dumps({'op': 1, 'd': self.seq}))
+                beat_at, acked = time.monotonic() + interval, False
+
+    def closed(self, code, said):
+        why = f'Discord closed the gateway with {code}' + (f' ({said})' if said else '')
+        if code in GATEWAY_STOPS:
+            raise Stopped(f'{why}: {GATEWAY_STOPS[code]}')
+        if code in GATEWAY_FRESH:
+            self.session, self.seq = None, None
+        raise Drop(why)
+
+    def dispatched(self, kind, data):
+        if kind == 'READY':
+            self.session = (data['session_id'], data['resume_gateway_url'])
+        if kind in ('READY', 'RESUMED'):
+            self.ready = True
+            log(f'gateway: {kind.lower()}')
+            if self.reported:
+                self.reported = False
+                self.report('back', 'AogoWimsy hears Discord again')
+        self.hear(kind, data)
+
+
+def safe_name(name):
+    """a file name as one item of the attachments list"""
+    return re.sub(r'[;\r\n]', '_', name or '')
+
+
+class Ear:
+    """what the gateway hears, sorted: every message goes to the waits on its channel; the session gets, pushed as a
+    channel event, each message addressed to AogoWimsy from the owner or a listed user, their DMs, a stranger's
+    addressed message the owner let through with his WIMSY reaction, and only the name of a stranger who wrote in
+    DMs; the owner's reply that mentions AogoWimsy carries the message he replied to, and lets it through. Nothing
+    for anyone else."""
+
+    def __init__(self, tools, push, stop):
+        self.tools, self.hub, self.push, self.stop = tools, tools.hub, push, stop
+        self.queue = queue.Queue()
+        self.kinds = {}  # a channel's id: its type and parent, from the gateway or asked once
+        self.knocked = set()  # strangers whose DM was told
+
+    def feed(self, kind, data):
+        """from the gateway's thread: never waits on Discord's REST there"""
+        self.queue.put((kind, data))
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                kind, data = self.queue.get(timeout=STOP_LOOK)
+            except queue.Empty:
+                continue
+            try:
+                self.hear(kind, data)
+            except Exception as error:  # noqa: BLE001 - a Discord error or a bug: said, and the ear goes on
+                log(f'channel: a {kind} event failed: {type(error).__name__}: {error}')
+                if not isinstance(error, DiscordError):
+                    log(traceback.format_exc())
+                self.push(
+                    f'AogoWimsy could not sort a {kind} event: {type(error).__name__}: {error}', {'kind': 'error'}
+                )
+
+    def report(self, kind, text):
+        """the gateway's news, to the session and the waits"""
+        if kind == 'stopped':
+            self.hub.stop(text)
+            self.push(
+                f'AogoWimsy stopped hearing Discord: {text}. discord_wait cannot hear; discord_read and discord_post '
+                'work.',
+                {'kind': 'error'},
+            )
+        elif kind == 'trouble':
+            self.push(f"AogoWimsy cannot reach Discord's gateway: {text}", {'kind': 'error'})
+        else:
+            self.push(text, {'kind': 'notice'})
+
+    def hear(self, kind, data):
+        if kind == 'READY':
+            self.tools.known['me'] = data['user']['id']
+            self.hub.gap()
+        elif kind == 'GUILD_CREATE':
+            for channel in (data.get('channels') or []) + (data.get('threads') or []):
+                self.kinds[channel['id']] = (channel.get('type'), channel.get('parent_id'))
+        elif kind in ('CHANNEL_CREATE', 'CHANNEL_UPDATE', 'THREAD_CREATE', 'THREAD_UPDATE'):
+            self.kinds[data['id']] = (data.get('type'), data.get('parent_id'))
+        elif kind == 'MESSAGE_CREATE':
+            self.hub.deliver(data)
+            self.message(data)
+        elif kind == 'MESSAGE_REACTION_ADD':
+            self.reaction(data)
+
+    def in_scope(self, channel):
+        listed = self.tools.settings.channels
+        if listed is None or channel in listed:
+            return True
+        if channel not in self.kinds:
+            found = self.tools.discord('GET', f'/channels/{channel}')
+            self.kinds[channel] = (found.get('type'), found.get('parent_id'))
+        kind, parent = self.kinds[channel]
+        return kind in THREADS and parent in listed
+
+    def message(self, message):
+        me, author = self.tools.me(), message['author']['id']
+        if author == me:
+            return
+        people = self.tools.people()
+        if not message.get('guild_id'):
+            if author in people:
+                self.tell(message, 'message')
+            elif author not in self.knocked:
+                self.knocked.add(author)
+                name = message['author'].get('global_name') or message['author'].get('username') or ''
+                text = f'{name} ({author}) wrote to AogoWimsy in DMs; nothing of what they wrote reaches the session'
+                self.push(text, {'kind': 'dm', 'author': name, 'author_id': author})
+                log('channel: pushed a dm event')
+            return
+        channel = message['channel_id']
+        if author in people and addressed(message, me) and self.in_scope(channel):
+            quoted, number = None, quoting(message, self.tools.settings.owner, me)
+            if number:
+                self.tools.approved.add(number)
+                if 'referenced_message' in message:
+                    quoted = message['referenced_message']  # None: it was deleted
+                else:
+                    quoted = self.tools.discord('GET', f'/channels/{channel}/messages/{number}')
+            self.tell(message, 'message', quoted)
+
+    def reaction(self, event):
+        emoji = event.get('emoji') or {}
+        if event.get('user_id') != self.tools.settings.owner or emoji.get('name') != WIMSY or not event.get('guild_id'):
+            return
+        channel, number = event['channel_id'], event['message_id']
+        if number in self.tools.approved:
+            return
+        message = self.tools.discord('GET', f'/channels/{channel}/messages/{number}')
+        me, author = self.tools.me(), message['author']['id']
+        if author == me or author in self.tools.people() or not addressed(message, me) or not self.in_scope(channel):
+            return
+        self.tools.approved.add(number)
+        self.tell(dict(message, channel_id=channel), 'approved')
+
+    def tell(self, message, kind, quoted=None):
+        """a message pushed whole; with quoted, the message the owner replied to, whole too"""
+        seen = view(message)
+        meta = {
+            'kind': kind,
+            'author': seen['author'] or '',
+            'author_id': seen['author_id'],
+            'channel': message['channel_id'],
+            'message_id': seen['id'],
+        }
+        if seen['reply_to']:
+            meta['reply_to'] = seen['reply_to']
+        if seen['attachments']:
+            meta['attachments'] = '; '.join(safe_name(name) for name in seen['attachments'])
+        text = seen['text'] or ('(no text: attachments only)' if seen['attachments'] else '(no text)')
+        if quoted:
+            them = view(quoted)
+            meta.update(quoted_author=them['author'] or '', quoted_author_id=them['author_id'])
+            if them['attachments']:
+                meta['quoted_attachments'] = '; '.join(safe_name(name) for name in them['attachments'])
+            said = them['text'] or ('(no text: attachments only)' if them['attachments'] else '(no text)')
+            text += f'\n\nReplying to {them["author"]} ({them["author_id"]}), message {them["id"]}:\n{said}'
+        self.push(text, meta)
+        log(f'channel: pushed a {kind} event')
 
 
 ID = {'type': 'string', 'pattern': '^[0-9]{17,20}$'}
 SECONDS = {'type': 'integer', 'minimum': 0, 'maximum': MOST_WAIT}
+FROM = {
+    'type': 'array',
+    'items': ID,
+    'minItems': 1,
+    'description': 'only these authors: ids of the owner or of listed users',
+}
 MESSAGE = (
     '{"id", "author" (their name), "author_id", "time" (ISO 8601), "text", "reply_to" (the id it answers, or null), '
-    '"attachments" (file names)}'
+    '"attachments" (file names), "approved" (true for a stranger\'s message the owner let through)}'
+)
+WHERE = (
+    'Channels: those AOGOWIMSY_CHANNELS lists and their threads, or every one Discord lets the bot see when it lists '
+    "none, and the owner's DMs with AogoWimsy (the channel in each draft's link)."
 )
 TOOLS = [
     {
@@ -566,11 +1215,11 @@ TOOLS = [
             "Post a message on Discord once the owner approves it. The draft goes to the owner's DMs with AogoWimsy "
             f"(the text, and under it where it goes) with {YES} and {NO}: only the owner's {YES} posts it, as it "
             "is, pinging no one; another person's reaction counts for nothing. It posts in the channels "
-            'AOGOWIMSY_CHANNELS lists and their threads. Waits up to `wait` seconds for the answer, then returns JSON: '
-            '{"status": "sent", "link", "message", "channel", "draft"} when approved; {"status": "not sent", '
-            '"channel", "draft"} when refused; {"status": "waiting", "draft", "link", "waited"} when not answered '
-            'yet: call discord_post_status with that draft to wait on. An error names the value refused and what '
-            'is taken.'
+            'AOGOWIMSY_CHANNELS lists and their threads, or in any Discord lets the bot see when it lists none. '
+            'Waits up to `wait` seconds for the answer, then returns JSON: {"status": "sent", "link", "message", '
+            '"channel", "draft"} when approved; {"status": "not sent", "channel", "draft"} when refused; {"status": '
+            '"waiting", "draft", "link", "waited"} when not answered yet: call discord_post_status with that draft '
+            'to wait on. An error names the value refused and what is taken.'
         ),
         'inputSchema': {
             'type': 'object',
@@ -611,10 +1260,10 @@ TOOLS = [
         'description': (
             "Read a channel's messages: the first `limit` after the id `after`, or the newest `limit` without it, "
             'oldest first. Returns JSON {"channel", "messages": [' + MESSAGE + '], "left_out", "after"}. Only the '
-            "owner's messages, the listed users' and AogoWimsy's own are given; left_out counts the others, and "
-            'nothing else of them is. "after" is the newest id read, to read on from. Channels: those '
-            "AOGOWIMSY_CHANNELS lists, their threads, and the owner's DMs with AogoWimsy (the channel in each "
-            "draft's link)."
+            "owner's messages, the listed users' and AogoWimsy's own are given, or only those of the authors `from` "
+            "names; and, without `from`, a stranger's message the owner let through: addressed to AogoWimsy with "
+            f'his :{WIMSY}: reaction on it, or one he replied to mentioning AogoWimsy. left_out counts the others, '
+            'and nothing else of them is given. "after" is the newest id read, to read on from. ' + WHERE
         ),
         'inputSchema': {
             'type': 'object',
@@ -628,6 +1277,7 @@ TOOLS = [
                     'default': 50,
                     'description': 'how many messages to read',
                 },
+                'from': FROM,
             },
             'required': ['channel'],
             'additionalProperties': False,
@@ -636,11 +1286,11 @@ TOOLS = [
     {
         'name': 'discord_wait',
         'description': (
-            'Wait up to `wait` seconds for the first message after the id `after` from the owner or a listed user, '
-            'looking every few seconds. Returns JSON {"channel", "message": ' + MESSAGE + ', "left_out", "after"}, '
-            'or {"channel", "message": null, "waited", "left_out", "after"} when none came: wait again after that '
-            '"after". AogoWimsy\'s own messages are passed over; left_out counts the other people\'s, and nothing '
-            'else of them is given. Channels: as discord_read.'
+            'Wait up to `wait` seconds for the first message after the id `after` from the owner or a listed user '
+            '(or from the authors `from` names), as Discord\'s gateway brings it. Returns JSON {"channel", '
+            '"message": ' + MESSAGE + ', "left_out", "after"}, or {"channel", "message": null, "waited", '
+            '"left_out", "after"} when none came: wait again after that "after". AogoWimsy\'s own messages are '
+            "passed over; left_out counts the other people's, and nothing else of them is given. " + WHERE
         ),
         'inputSchema': {
             'type': 'object',
@@ -648,6 +1298,7 @@ TOOLS = [
                 'channel': dict(ID, description='the channel, thread or DM id to watch'),
                 'after': dict(ID, description='wait for a message after this message id'),
                 'wait': dict(SECONDS, default=600, description='seconds to wait'),
+                'from': FROM,
             },
             'required': ['channel', 'after'],
             'additionalProperties': False,
@@ -681,13 +1332,33 @@ def log(text):
     print(f'aogowimsy: {text}', file=sys.stderr, flush=True)
 
 
-class Server:
-    """MCP's JSON-RPC: 2026-07-28 a request at a time, and 2025-11-25 back to 2024-11-05 after initialize"""
+class LineWriter:
+    """JSON-RPC messages on a stream, a whole line each: one lock for the answers, the progress and the channel
+    pushes, so no two threads write into one line"""
 
-    def __init__(self, tools, instructions, write):
-        self.tools, self.instructions, self.write = tools, instructions, write
+    def __init__(self, stream):
+        self.stream, self.guard = stream, threading.Lock()
+
+    def __call__(self, message):
+        line = json.dumps(message, separators=(',', ':')).encode() + b'\n'
+        with self.guard:
+            try:
+                self.stream.write(line)
+                self.stream.flush()
+            except OSError as error:
+                log(f'stdout is closed: {error}')
+
+
+class Server:
+    """MCP's JSON-RPC after the initialize handshake, 2025-11-25 back to 2024-11-05; once the client says it is
+    initialized, listen(push) starts hearing Discord and returns its threads"""
+
+    def __init__(self, tools, instructions, write, listen=None, stopping=None):
+        self.tools, self.instructions, self.write, self.listen = tools, instructions, write, listen
+        self.stopping = stopping or threading.Event()
         self.agreed = None  # the version an initialize agreed on
         self.running = {}  # a tools/call's id: the event that cancels it
+        self.threads = []  # the ones listen started
         self.guard = threading.Lock()
 
     def begin(self, rid):
@@ -699,7 +1370,8 @@ class Server:
             self.running.pop(rid, None)
 
     def stop(self):
-        """every running request cancelled: the client closed stdin"""
+        """every running request cancelled and the listening ended: the client closed stdin"""
+        self.stopping.set()
         with self.guard:
             for event in self.running.values():
                 event.set()
@@ -713,12 +1385,19 @@ class Server:
         finally:
             self.end(message['id'])
 
+    def push(self, content, meta):
+        """a channel event into the session"""
+        self.write({'jsonrpc': '2.0', 'method': CHANNEL_PUSH, 'params': {'content': content, 'meta': meta}})
+
     def notified(self, method, params):
         if method == 'notifications/cancelled':
             event = self.running.get(params.get('requestId'))
             if event:
                 event.set()
-        elif method != 'notifications/initialized':
+        elif method == 'notifications/initialized':
+            if self.agreed and self.listen and not self.threads and not self.stopping.is_set():
+                self.threads = self.listen(self.push)
+        else:
             log(f'notification {shown(method)} does nothing here')
 
     def handle(self, message, cancelled=None):
@@ -744,55 +1423,43 @@ class Server:
             return failure(None, -32600, f'Invalid Request: id is {shown(rid)}, not a string or a whole number')
         if not isinstance(params, dict):
             return failure(rid, -32602, f'Invalid params: params is a JSON {kind_of(params)}, not an object')
+        if method == 'server/discover':
+            return failure(
+                rid,
+                -32601,
+                'Method not found: server/discover; AogoWimsy speaks the initialize handshake '
+                f'({", ".join(VERSIONS)}), '
+                'as Claude Code registers no channel on 2026-07-28',
+            )
         if method not in METHODS:
             return failure(rid, -32601, f'Method not found: {shown(method)}; AogoWimsy answers {", ".join(METHODS)}')
         if method == 'initialize':
             return self.initialize(rid, params)
-        meta = params.get('_meta') if isinstance(params.get('_meta'), dict) else {}
-        version = meta.get(VERSION_KEY)
-        if version is not None:
-            if version not in MODERN + LEGACY:
-                data = {'supported': list(MODERN + LEGACY), 'requested': version}
-                return failure(rid, -32022, 'Unsupported protocol version', data)
-            if version in MODERN and not isinstance(meta.get(CAPABILITIES_KEY), dict):
-                return failure(rid, -32602, f'Invalid params: _meta has no {CAPABILITIES_KEY}, which {version} needs')
-        elif self.agreed is None and method != 'ping':
+        if self.agreed is None and method != 'ping':
             return failure(
-                rid,
-                -32602,
-                f'Invalid params: {method} came with no _meta {VERSION_KEY} and before any initialize: AogoWimsy '
-                f'answers {", ".join(MODERN)} with it, and {", ".join(LEGACY)} after initialize',
+                rid, -32602, f'Invalid params: {method} came before initialize; AogoWimsy speaks {", ".join(VERSIONS)}'
             )
-        modern = version in MODERN
-        if (method == 'ping' and modern) or (method == 'server/discover' and not modern):
-            return failure(rid, -32601, f'Method not found: {method} is no method of {version or self.agreed}')
         if method == 'ping':
             result = {}
-        elif method == 'server/discover':
-            result = {'supportedVersions': list(MODERN + LEGACY), 'capabilities': {'tools': {}}}
-            result['instructions'] = self.instructions
         elif method == 'tools/list':
             if params.get('cursor') is not None:
                 return failure(rid, -32602, f'Invalid params: cursor {shown(params["cursor"])}: the tools are one page')
             result = {'tools': TOOLS}
         else:
+            meta = params.get('_meta') if isinstance(params.get('_meta'), dict) else {}
             result = self.call(rid, params, meta, cancelled or threading.Event())
             if result is None or 'error' in result:
                 return result
-        if modern:
-            result = dict(result, resultType='complete', _meta={SERVER_INFO_KEY: SERVER_INFO})
-            if method in ('tools/list', 'server/discover'):
-                result.update(ttlMs=TTL_MS, cacheScope='private')
         return {'jsonrpc': '2.0', 'id': rid, 'result': result}
 
     def initialize(self, rid, params):
         asked = params.get('protocolVersion')
         if not isinstance(asked, str):
             return failure(rid, -32602, f'Invalid params: protocolVersion is {shown(asked)}, not a version string')
-        self.agreed = asked if asked in LEGACY else LEGACY[0]
+        self.agreed = asked if asked in VERSIONS else VERSIONS[0]
         result = {
             'protocolVersion': self.agreed,
-            'capabilities': {'tools': {}},
+            'capabilities': CAPABILITIES,
             'serverInfo': SERVER_INFO,
             'instructions': self.instructions,
         }
@@ -863,9 +1530,15 @@ def serve(server, reader, write, linger=40.0):
         if answer is not None:
             write(answer)
     server.stop()
-    end = time.monotonic() + linger  # a post under way ends; a wait ends at once
-    for worker in workers:
-        worker.join(max(0.0, end - time.monotonic()))
+    end = time.monotonic() + linger  # a post under way ends; a wait and the gateway end at once
+    for thread in workers + server.threads:
+        thread.join(max(0.0, end - time.monotonic()))
+
+
+def started(target):
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread
 
 
 def main(argv=None):
@@ -879,21 +1552,19 @@ def main(argv=None):
         settings = read_settings(path)
     except Refused as error:
         sys.exit(f'aogowimsy: {error}')
-    clock = Clock()
-    tools = AogoWimsy(settings, Discord(settings.token, clock), clock)
-    out, guard = sys.stdout.buffer, threading.Lock()
+    clock, stop = Clock(), threading.Event()
+    discord = Discord(settings.token, clock)
+    tools = AogoWimsy(settings, discord, clock)
+    write = LineWriter(sys.stdout.buffer)
 
-    def write(message):
-        line = json.dumps(message, separators=(',', ':')).encode() + b'\n'
-        with guard:
-            try:
-                out.write(line)
-                out.flush()
-            except OSError as error:
-                log(f'stdout is closed: {error}')
+    def listen(push):
+        ear = Ear(tools, push, stop)
+        gateway = Gateway(settings.token, discord, ear.feed, ear.report, stop)
+        return [started(ear.run), started(gateway.run)]
 
-    log(f'up: owner {settings.owner}, {len(settings.users)} users, {len(settings.channels)} channels')
-    serve(Server(tools, instructions(settings), write), sys.stdin.buffer, write)
+    where = 'every channel it sees' if settings.channels is None else f'{len(settings.channels)} channels'
+    log(f'up: owner {settings.owner}, {len(settings.users)} users, {where}')
+    serve(Server(tools, instructions(settings), write, listen, stop), sys.stdin.buffer, write)
 
 
 if __name__ == '__main__':
