@@ -900,8 +900,43 @@ class Channels(WithDiscord):
     def reacted(self, channel, message, emoji, who):
         self.fake.react(message, emoji, who)
         name, _, number = emoji.partition(':')
-        event = {'user_id': who, 'channel_id': channel, 'message_id': message, 'guild_id': GUILD}
+        event = {'user_id': who, 'channel_id': channel, 'message_id': message}
+        if self.fake.channels[channel].get('guild_id'):
+            event['guild_id'] = self.fake.channels[channel]['guild_id']
         self.ear.hear('MESSAGE_REACTION_ADD', dict(event, emoji={'id': number or None, 'name': name}))
+
+    def test_the_owners_answer_to_a_draft_posts_it_at_once_with_no_tool_waiting(self):
+        draft = self.tool('discord_post', channel=GENERAL, text='approved later', wait=0)['draft']
+        refused = self.tool('discord_post', channel=HELP, text='refused later', wait=0)['draft']
+        self.reacted(DM, draft, YES, STRANGER)
+        self.reacted(DM, draft, YES, BOT)
+        self.assertEqual((self.fake.messages[GENERAL], self.pushes), ([], []))
+        self.reacted(DM, draft, YES, OWNER)
+        posted = self.fake.last(GENERAL)
+        self.assertEqual((posted['content'], len(self.fake.messages[GENERAL])), ('approved later', 1))
+        sent = f'https://discord.com/channels/{GUILD}/{GENERAL}/{posted["id"]}'
+        meta = {'kind': 'draft', 'draft': draft, 'status': 'sent', 'channel': GENERAL, 'message_id': posted['id']}
+        self.assertEqual(self.pushes, [(f'The owner approved draft {draft}: posted as {sent}', meta)])
+        self.reacted(DM, draft, YES, OWNER)  # the event again, or a tool that saw it first: never twice
+        self.assertEqual((len(self.fake.messages[GENERAL]), len(self.pushes)), (1, 1))
+        self.assertEqual(self.tool('discord_post_status', draft=draft, wait=0)['message'], posted['id'])
+        self.reacted(DM, refused, NO, OWNER)
+        self.assertEqual(self.fake.messages[HELP], [])
+        self.assertEqual(self.fake.footer(self.fake.find(DM, refused)), f'not sent: to {HELP}')
+        meta = {'kind': 'draft', 'draft': refused, 'status': 'not sent', 'channel': HELP}
+        self.assertEqual(self.pushes[1:], [(f'The owner refused draft {refused}: not posted to channel {HELP}', meta)])
+        mine = self.fake.say(DM, OWNER, 'not a draft')
+        self.reacted(DM, mine, YES, OWNER)
+        self.assertEqual(len(self.pushes), 2)
+
+    def test_a_draft_another_session_made_waits_for_that_sessions_look(self):
+        other = aw.AogoWimsy(self.settings, aw.Discord(TOKEN, self.clock, self.api), self.clock)
+        self.server = self.started_server(other)
+        draft = self.tool('discord_post', channel=GENERAL, text='from another session', wait=0)['draft']
+        self.reacted(DM, draft, YES, OWNER)  # this session's ear: not its draft
+        self.assertEqual((self.fake.messages[GENERAL], self.pushes), ([], []))
+        self.assertEqual(self.tool('discord_post_status', draft=draft, wait=0)['status'], 'sent')
+        self.assertEqual(len(self.fake.messages[GENERAL]), 1)
 
     def test_a_reply_to_aogo_from_the_owner_is_pushed_once_with_its_fields(self):
         mine = self.fake.say(GENERAL, BOT, 'a post of mine')

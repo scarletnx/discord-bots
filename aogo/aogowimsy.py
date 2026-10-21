@@ -237,8 +237,9 @@ def instructions(settings):
         'the message he replied to, and quoted_author and quoted_author_id name its author), kind="approved" (a '
         "stranger's addressed message the owner let through with the reaction), each with author, author_id, "
         'channel, message_id and reply_to; kind="dm" (someone else wrote to AogoWimsy in DMs: their name only), '
-        'kind="error" or "notice" (the gateway). Answer in Discord with discord_post, reply_to the message_id: it '
-        f"still waits for the owner's {YES}."
+        'kind="draft" (the owner answered a draft in his DMs, and it was posted or refused at once: draft, status, '
+        'channel, and message_id once posted), kind="error" or "notice" (the gateway). Answer in Discord with '
+        f"discord_post, reply_to the message_id: it still waits for the owner's {YES}."
     )
 
 
@@ -506,6 +507,8 @@ class AogoWimsy:
         self.approved = set()  # the messages the owner let through while the gateway heard: their ids, in memory only
         self.guard = threading.Lock()
         self.drafts = {}  # a lock a draft: one look at a time, so no draft is posted twice
+        self.made = set()  # the drafts this AogoWimsy made: the gateway's answers act on these alone, as every
+        # session started in the workspace runs one and they share no lock
 
     def me(self):
         if 'me' not in self.known:
@@ -582,6 +585,7 @@ class AogoWimsy:
         dm = self.dm()
         body = {'content': text, 'embeds': [waiting_card(where, reply_to)], 'allowed_mentions': {'parse': []}}
         draft = self.discord('POST', f'/channels/{dm}/messages', body)['id']
+        self.made.add(draft)
         for emoji in (YES, NO):
             self.discord('PUT', f'/channels/{dm}/messages/{draft}/reactions/{urllib.parse.quote(emoji)}/@me')
         return self.verdict(draft, wait, cancelled, progress)
@@ -621,20 +625,42 @@ class AogoWimsy:
                         f'draft {draft} says it is being posted to channel {channel}: another AogoWimsy is posting '
                         'it, or one stopped while it did; look in that channel, AogoWimsy posts no draft twice'
                     )
-                yes, no = self.answer(dm, message)
-                if no:
-                    card = {'title': 'Not sent', 'description': f'{NO}: not sent to channel {channel}.'}
-                    card['footer'] = {'text': footer('not sent', channel, state['reply_to'])}
-                    self.edit(dm, draft, card)
-                    return {'status': 'not sent', 'channel': channel, 'draft': draft}
-                if yes:
-                    return self.send(dm, message, state)
+                got = self.decide(dm, message, state)
+                if got:
+                    return got
             waited = self.clock.now() - start
             if waited >= wait:
                 return {'status': 'waiting', 'draft': draft, 'link': link(None, dm, draft), 'waited': round(waited)}
             if self.clock.wait(min(POLL, wait - waited), cancelled):
                 raise Cancelled
             progress(self.clock.now() - start, wait, f"waiting for the owner's answer to draft {draft}")
+
+    def decide(self, dm, message, state):
+        """a waiting draft, under its lock: refused or posted when the owner has answered, else None"""
+        channel = state['channel']
+        yes, no = self.answer(dm, message)
+        if no:
+            card = {'title': 'Not sent', 'description': f'{NO}: not sent to channel {channel}.'}
+            card['footer'] = {'text': footer('not sent', channel, state['reply_to'])}
+            self.edit(dm, message['id'], card)
+            return {'status': 'not sent', 'channel': channel, 'draft': message['id']}
+        if yes:
+            return self.send(dm, message, state)
+        return None
+
+    def answered(self, draft):
+        """the owner's answer the gateway brought, on a draft this AogoWimsy made and still waiting: posted or refused
+        at once, whether a tool waits on it or not; None for any other message of his DMs (another session's draft
+        waits for that session's look, or a discord_post_status)"""
+        if draft not in self.made:
+            return None
+        dm, me = self.dm(), self.me()
+        with self.lock(draft):
+            message = self.discord('GET', f'/channels/{dm}/messages/{draft}')
+            state = draft_state(message) if message['author']['id'] == me else None
+            if state is None or state['kind'] != 'waiting':
+                return None
+            return self.decide(dm, message, state)
 
     def reactors(self, channel, message, emoji):
         """the ids of who reacted to a message with an emoji (a name, or name:id for a custom one)"""
@@ -1154,7 +1180,13 @@ class Ear:
 
     def reaction(self, event):
         emoji = event.get('emoji') or {}
-        if event.get('user_id') != self.tools.settings.owner or emoji.get('name') != WIMSY or not event.get('guild_id'):
+        if event.get('user_id') != self.tools.settings.owner:
+            return
+        if not event.get('guild_id'):
+            if event['channel_id'] == self.tools.dm() and emoji.get('id') is None and emoji.get('name') in (YES, NO):
+                self.drafted(event['message_id'])
+            return
+        if emoji.get('name') != WIMSY:
             return
         channel, number = event['channel_id'], event['message_id']
         if number in self.tools.approved:
@@ -1165,6 +1197,20 @@ class Ear:
             return
         self.tools.approved.add(number)
         self.tell(dict(message, channel_id=channel), 'approved')
+
+    def drafted(self, draft):
+        """the owner's check mark or cross on a waiting draft: it is posted or refused now, not on a tool's next look,
+        and the session is told"""
+        got = self.tools.answered(draft)
+        if got is None:
+            return
+        meta = {'kind': 'draft', 'draft': draft, 'status': got['status'], 'channel': got['channel']}
+        if got['status'] == 'sent':
+            meta['message_id'] = got['message']
+            self.push(f'The owner approved draft {draft}: posted as {got["link"]}', meta)
+        else:
+            self.push(f'The owner refused draft {draft}: not posted to channel {got["channel"]}', meta)
+        log(f'channel: draft {got["status"]}')
 
     def tell(self, message, kind, quoted=None):
         """a message pushed whole; with quoted, the message the owner replied to, whole too"""
