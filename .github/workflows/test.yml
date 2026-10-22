@@ -1,7 +1,7 @@
 name: Tests
 
-# ReiWimsy's tests (make -C rei test: no Discord, no network, no Concord) and Xuji's, on each pull request and each
-# push to main
+# ReiWimsy's tests (make -C rei test: no Discord, no network, no Concord), Xuji's and AogoWimsy's, on each pull request
+# and each push to main
 on:
   push:
     branches: [main]
@@ -19,3 +19,4 @@ jobs:
       - uses: actions/checkout@v7
       - run: make -C rei test
       - run: python3 xuji/test_xuji.py
+      - run: python3 aogo/test_aogowimsy.py
