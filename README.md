@@ -55,6 +55,10 @@ file; Xuji's privacy scrub, transcript and prompts.
     bastille create discordbots 15.1-RELEASE <ip> <interface>   # once, or the host's own tool for jails
     cd deploy && sh install.sh          # again after each change: builds ReiWimsy there, keeps the tokens
 
+Concord is built at its pinned commit with the fixes in `deploy/*.patch` that it does not have yet (install.sh's
+`CONCORD_PATCHES`), their tests run before it is installed; a new patch builds it again. The running bot keeps the old
+build until `service reiwimsy restart`.
+
 Each bot's tokens are in the jail's `/usr/local/etc/<bot>.env` (root's, 600; the `.env.example` beside install.sh
 lists the keys). A service refuses to start while a value is empty. Then:
 

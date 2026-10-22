@@ -1,0 +1,162 @@
+From 3f1477226da5d7ef5e9e69c6c1b3540e0007949a Mon Sep 17 00:00:00 2001
+From: AO55 <AO55@reden-emu.dev>
+Date: Thu, 22 Oct 2026 08:41:02 -0300
+Subject: [PATCH] fix(gateway): a heartbeat that cannot be sent counts as never
+ ACK'd
+
+A connection that dies without a CLOSE leaves the websocket CONNECTED while curl cannot send. The failed pulse left hbeat_last behind, so the heartbeat timer refired every millisecond retrying it, and hbeat_acknowledged true, so the zombie check never ran and the gateway never reconnected. It now counts as sent and never ACK'd: the next tick, an interval later, reconnects.
+
+Signed-off-by: AO55 <AO55@reden-emu.dev>
+---
+ src/discord-gateway_dispatch.c | 22 +++++++++++--------
+ test/mock-websockets.c         | 10 ++++++++-
+ test/mock-websockets.h         |  6 ++++++
+ test/unit-gateway-lifecycle.c  | 39 ++++++++++++++++++++++++++++++++++
+ 4 files changed, 67 insertions(+), 10 deletions(-)
+
+diff --git a/src/discord-gateway_dispatch.c b/src/discord-gateway_dispatch.c
+index f0f8398..9dad71a 100644
+--- a/src/discord-gateway_dispatch.c
++++ b/src/discord-gateway_dispatch.c
+@@ -322,21 +322,25 @@ discord_gateway_send_heartbeat(struct discord_gateway *gw, int seq)
+         io_poller_curlm_enable_perform(CLIENT(gw, gw)->io_poller, gw->mhandle);
+         logmod_log(INFO, gw->logger, "%s HEARTBEAT (%zu bytes)",
+                    LML(gw->logger, REGULAR, INTENSITY, GREEN, "SEND"), b.pos);
+-
+-        gw->timer->hbeat_acknowledged = false;
+-
+-        /* update heartbeat timestamp */
+-        gw->timer->hbeat_last = gw->timer->now;
+-        if (!gw->timer->hbeat_timer)
+-            gw->timer->hbeat_timer = discord_internal_timer(
+-                CLIENT(gw, gw), _discord_on_heartbeat_timeout, NULL, gw,
+-                gw->timer->hbeat_interval);
+     }
+     else {
++        /* a pulse that could not go (a connection that died without a
++         * CLOSE) counts as one never ACK'd: the next tick, an interval
++         * later, finds it so and reconnects, where retrying it at once
++         * spins on the dead connection forever */
+         logmod_log(INFO, gw->logger, "%s HEARTBEAT (%zu bytes)",
+                    LML(gw->logger, REGULAR, FOREGROUND, RED, "FAIL SEND"),
+                    b.pos);
+     }
++
++    gw->timer->hbeat_acknowledged = false;
++
++    /* update heartbeat timestamp */
++    gw->timer->hbeat_last = gw->timer->now;
++    if (!gw->timer->hbeat_timer)
++        gw->timer->hbeat_timer = discord_internal_timer(
++            CLIENT(gw, gw), _discord_on_heartbeat_timeout, NULL, gw,
++            gw->timer->hbeat_interval);
+ }
+ 
+ void
+diff --git a/test/mock-websockets.c b/test/mock-websockets.c
+index aadd7e3..6319e77 100644
+--- a/test/mock-websockets.c
++++ b/test/mock-websockets.c
+@@ -30,6 +30,8 @@ struct websockets {
+     enum ws_close_reason close_code;
+     char close_reason[128];
+     uint64_t now;
++    /* mockws_fail_sends() */
++    int fail_sends;
+ };
+ 
+ /* ── ws_* interface ───────────────────────────────────────────────── */
+@@ -70,7 +72,7 @@ ws_send_text(struct websockets *ws, const char text[], size_t len)
+ {
+     struct mockws_frame *frame;
+ 
+-    if (ws->status != WS_CONNECTED) return 0;
++    if (ws->status != WS_CONNECTED || ws->fail_sends) return 0;
+     if (!(frame = calloc(1, sizeof *frame))) return 0;
+     if (!(frame->text = malloc(len + 1))) return free(frame), 0;
+     memcpy(frame->text, text, len);
+@@ -296,3 +298,9 @@ mockws_drain_sent(struct websockets *ws)
+     while ((text = mockws_pop_sent(ws)))
+         free(text);
+ }
++
++void
++mockws_fail_sends(struct websockets *ws, int fail)
++{
++    ws->fail_sends = fail;
++}
+diff --git a/test/mock-websockets.h b/test/mock-websockets.h
+index 1261116..901c7b5 100644
+--- a/test/mock-websockets.h
++++ b/test/mock-websockets.h
+@@ -54,4 +54,10 @@ size_t mockws_sent_count(struct websockets *ws);
+ /* discard all captured outbound frames */
+ void mockws_drain_sent(struct websockets *ws);
+ 
++/* while FAIL is nonzero ws_send_* fails although the handle stays
++ * WS_CONNECTED: a connection that died without a CLOSE, which the real
++ * transport sees only when curl cannot send ("No associated
++ * connection") */
++void mockws_fail_sends(struct websockets *ws, int fail);
++
+ #endif /* MOCK_WEBSOCKETS_H */
+diff --git a/test/unit-gateway-lifecycle.c b/test/unit-gateway-lifecycle.c
+index a73eb84..49194d7 100644
+--- a/test/unit-gateway-lifecycle.c
++++ b/test/unit-gateway-lifecycle.c
+@@ -206,6 +206,44 @@ zombie_connection_reconnects(void)
+     PASS();
+ }
+ 
++TEST
++failed_heartbeat_send_reconnects(void)
++{
++    struct test_gateway tg;
++    struct discord_timer t = { 0 };
++    enum ws_close_reason code = 0;
++
++    ASSERT_EQ(0, tg_boot(&tg));
++    ASSERT_EQ(0, tg_connect(&tg));
++    ASSERT_EQ(0, tg_handshake(&tg));
++    tg_deliver(&tg, "{\"t\":null,\"s\":null,\"op\":11,\"d\":null}"); /* ACK */
++
++    /* the connection died without a CLOSE: the pulse cannot go.  It counts
++     * as sent and never ACK'd, the next tick a whole interval on rather than
++     * at once (which spun on the dead connection), and that tick reconnects
++     * as for a zombie */
++    mockws_fail_sends(tg.ws, 1);
++    tg.gw->timer->hbeat_last = 1;
++    force_heartbeat_timer(&tg);
++
++    ASSERT_EQ((size_t)0, mockws_sent_count(tg.ws));
++    ASSERT_EQ(0, mockws_close_requested(tg.ws, NULL));
++    ASSERT_EQ(false, tg.gw->timer->hbeat_acknowledged);
++    ASSERT_EQ(tg.gw->timer->now, tg.gw->timer->hbeat_last);
++    t.id = tg.gw->timer->hbeat_timer;
++    t.flags = DISCORD_TIMER_GET;
++    ASSERT(discord_internal_timer_ctl(tg.client, &t));
++    ASSERT(t.interval > tg.gw->timer->hbeat_interval / 2);
++
++    force_heartbeat_timer(&tg);
++    ASSERT_EQ(1, mockws_close_requested(tg.ws, &code));
++    ASSERT_EQ(WS_CLOSE_REASON_NORMAL, code);
++    ASSERT(tg.gw->session->status & DISCORD_SESSION_SHUTDOWN);
++
++    tg_cleanup(&tg);
++    PASS();
++}
++
+ TEST
+ server_heartbeat_request_gets_reply(void)
+ {
+@@ -245,6 +283,7 @@ SUITE(gateway_lifecycle)
+     RUN_TEST(heartbeat_ack_cycle);
+     RUN_TEST(heartbeat_cadence_refire);
+     RUN_TEST(zombie_connection_reconnects);
++    RUN_TEST(failed_heartbeat_send_reconnects);
+     RUN_TEST(server_heartbeat_request_gets_reply);
+ }
+ 
+-- 
+2.55.0
+
