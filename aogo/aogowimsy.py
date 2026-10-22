@@ -45,6 +45,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import NamedTuple
 
@@ -56,6 +57,9 @@ ENV = '~/.config/aogowimsy/aogowimsy.env'
 NEEDED = ('AOGOWIMSY_TOKEN', 'AOGOWIMSY_OWNER', 'AOGOWIMSY_USERS')
 KEYS = (*NEEDED, 'AOGOWIMSY_CHANNELS')
 LIMIT = 2000  # a Discord message's letters
+IMAGES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp'}
+MOST_FILES = 4  # images a post carries; how big each may be is Discord's to say, in the owner's DMs first
+CDN = ('https://cdn.discordapp.com/', 'https://media.discordapp.net/')  # where a draft's images are fetched from
 POLL = 3.0  # seconds between two looks at a draft's reactions
 LOOK = 1.0  # seconds a wait sleeps at most before looking again at what the gateway brought
 MOST_WAIT = 3600  # seconds a tool waits at most
@@ -291,11 +295,14 @@ class Discord:
     def __init__(self, token, clock, api=API):
         self.token, self.clock, self.api = token, clock, api
 
-    def __call__(self, method, path, body=None, **query):
+    def __call__(self, method, path, body=None, files=None, **query):
+        """files: (name, bytes, type) sent with body as Discord's multipart form, files[n] each"""
         url = self.api + path + ('?' + urllib.parse.urlencode(query) if query else '')
         headers = {'Authorization': f'Bot {self.token}', 'User-Agent': AGENT}
         data = None
-        if body is not None:
+        if files:
+            data, headers['Content-Type'] = multipart(body, files)
+        elif body is not None:
             data = json.dumps(body).encode()
             headers['Content-Type'] = 'application/json'
         for attempt in range(1, TRIES + 1):
@@ -336,6 +343,72 @@ class Discord:
                 return json.loads(raw) if raw else None
             except ValueError:
                 raise DiscordError(f'Discord answered {method} {path} with something that is not JSON') from None
+
+    def download(self, url):
+        """an attachment's bytes from Discord's CDN (or, in the tests, from where the API is), without the token"""
+        api = urllib.parse.urlsplit(self.api)
+        if not url.startswith(CDN) and not url.startswith(f'{api.scheme}://{api.netloc}/attachments/'):
+            raise DiscordError(f'an attachment at {url}: AogoWimsy fetches them from {" or ".join(CDN)} alone')
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': AGENT}), timeout=60) as got:
+                return got.read()
+        except urllib.error.HTTPError as error:
+            raise DiscordError(f"Discord's CDN answered {error.code} to {url}", error.code) from None
+        except OSError as error:
+            raise DiscordError(
+                f"Discord's CDN could not be reached for {url}: {getattr(error, 'reason', error)}"
+            ) from None
+
+
+def multipart(body, files):
+    """a multipart/form-data body as Discord takes one: payload_json, then files[n]; and its Content-Type"""
+    boundary = uuid.uuid4().hex
+    parts = [
+        f'--{boundary}\r\nContent-Disposition: form-data; name="payload_json"\r\n'
+        'Content-Type: application/json\r\n\r\n'.encode()
+        + json.dumps(body).encode()
+        + b'\r\n'
+    ]
+    for place, (name, data, kind) in enumerate(files):
+        quoted = name.replace('\\', '_').replace('"', '_').replace('\r', '_').replace('\n', '_')
+        head = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="files[{place}]"; filename="{quoted}"\r\n'
+            f'Content-Type: {kind}\r\n\r\n'
+        )
+        parts.append(head.encode() + data + b'\r\n')
+    parts.append(f'--{boundary}--\r\n'.encode())
+    return b''.join(parts), f'multipart/form-data; boundary={boundary}'
+
+
+def images(value):
+    """the files discord_post was given, read: [(name, bytes, type)]; None for none; Refused naming what is wrong"""
+    if value is None:
+        return None
+    kinds = ', '.join(kind[1:] for kind in IMAGES)
+    if not isinstance(value, list):
+        raise Refused(f'files is a JSON {kind_of(value)}, not a list of 1 to {MOST_FILES} absolute paths of images')
+    if not value:
+        raise Refused(f'files is empty: 1 to {MOST_FILES} absolute paths of images ({kinds})')
+    if len(value) > MOST_FILES:
+        raise Refused(f'files names {len(value)} files: a post carries 1 to {MOST_FILES} images')
+    found = []
+    for place, item in enumerate(value, 1):
+        if not isinstance(item, str) or not os.path.isabs(item):
+            raise Refused(f'files item {place} is {shown(item)}, not an absolute path')
+        path = Path(item)
+        kind = IMAGES.get(path.suffix.lower())
+        if not kind:
+            raise Refused(
+                f'files item {place} is a {path.suffix or "file without a suffix"}: AogoWimsy posts images ({kinds})'
+            )
+        try:
+            data = path.read_bytes()
+        except OSError as error:
+            raise Refused(f'files item {place} is {item}, which cannot be read: {error.strerror or error}') from None
+        if not data:
+            raise Refused(f'files item {place}, {item}, is empty')
+        found.append((path.name, data, kind))
+    return found
 
 
 def link(guild, channel, message):
@@ -431,7 +504,8 @@ def take(args, tool, required, optional):
 
 
 def kind_of(value):
-    return {bool: 'boolean', int: 'number', float: 'number', list: 'array', dict: 'object'}.get(type(value), 'value')
+    kinds = {bool: 'boolean', int: 'number', float: 'number', str: 'string', list: 'array', dict: 'object'}
+    return kinds.get(type(value), 'value')
 
 
 class Inbox:
@@ -568,7 +642,7 @@ class AogoWimsy:
         return tools[name](args, cancelled, progress)
 
     def post(self, args, cancelled, progress):
-        take(args, 'discord_post', ('channel', 'text'), ('reply_to', 'wait'))
+        take(args, 'discord_post', ('channel', 'text'), ('reply_to', 'wait', 'files'))
         channel = snowflake(args['channel'], 'channel')
         text = args['text']
         if not isinstance(text, str):
@@ -579,12 +653,15 @@ class AogoWimsy:
             raise Refused(f'text has {len(text)} letters: a Discord message holds {LIMIT} at most')
         reply_to = None if args.get('reply_to') is None else snowflake(args['reply_to'], 'reply_to')
         wait = whole(args.get('wait'), 'wait', 300, 0, MOST_WAIT)
+        files = images(args.get('files'))
         where = self.where(channel, reading=False)
         if reply_to:
             self.discord('GET', f'/channels/{channel}/messages/{reply_to}')
         dm = self.dm()
         body = {'content': text, 'embeds': [waiting_card(where, reply_to)], 'allowed_mentions': {'parse': []}}
-        draft = self.discord('POST', f'/channels/{dm}/messages', body)['id']
+        if files:
+            body['attachments'] = [{'id': place, 'filename': name} for place, (name, _, _) in enumerate(files)]
+        draft = self.discord('POST', f'/channels/{dm}/messages', body, files)['id']
         self.made.add(draft)
         for emoji in (YES, NO):
             self.discord('PUT', f'/channels/{dm}/messages/{draft}/reactions/{urllib.parse.quote(emoji)}/@me')
@@ -703,8 +780,14 @@ class AogoWimsy:
         body = {'content': message['content'], 'allowed_mentions': {'parse': [], 'replied_user': False}}
         if reply_to:
             body['message_reference'] = {'message_id': reply_to, 'channel_id': channel, 'fail_if_not_exists': True}
+        files = []
         try:
-            posted = self.discord('POST', f'/channels/{channel}/messages', body)['id']
+            for item in message.get('attachments') or []:  # the draft's own: what the owner saw is what goes
+                kind = item.get('content_type') or 'application/octet-stream'
+                files.append((item['filename'], self.discord.download(item['url']), kind))
+            if files:
+                body['attachments'] = [{'id': place, 'filename': name} for place, (name, _, _) in enumerate(files)]
+            posted = self.discord('POST', f'/channels/{channel}/messages', body, files)['id']
         except DiscordError as error:
             try:
                 self.edit(dm, draft, waiting_card(where, reply_to, f'Posting failed: {error}'))
@@ -1259,7 +1342,7 @@ TOOLS = [
         'name': 'discord_post',
         'description': (
             "Post a message on Discord once the owner approves it. The draft goes to the owner's DMs with AogoWimsy "
-            f"(the text, and under it where it goes) with {YES} and {NO}: only the owner's {YES} posts it, as it "
+            f"(the text and its images, and under it where it goes) with {YES} and {NO}: only the owner's {YES} posts it, as it "
             "is, pinging no one; another person's reaction counts for nothing. It posts in the channels "
             'AOGOWIMSY_CHANNELS lists and their threads, or in any Discord lets the bot see when it lists none. '
             'Waits up to `wait` seconds for the answer, then returns JSON: {"status": "sent", "link", "message", '
@@ -1279,6 +1362,16 @@ TOOLS = [
                 },
                 'reply_to': dict(ID, description="the id of that channel's message it answers"),
                 'wait': dict(SECONDS, default=300, description="seconds to wait for the owner's answer"),
+                'files': {
+                    'type': 'array',
+                    'items': {'type': 'string'},
+                    'minItems': 1,
+                    'maxItems': MOST_FILES,
+                    'description': (
+                        f'absolute paths of 1 to {MOST_FILES} images ({", ".join(k[1:] for k in IMAGES)}) posted '
+                        "under the text: the draft carries them, and the post sends the draft's"
+                    ),
+                },
             },
             'required': ['channel', 'text'],
             'additionalProperties': False,

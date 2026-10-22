@@ -4,6 +4,8 @@ fake Discord REST served on 127.0.0.1 with a clock that only moves when a tool w
 pushes to the session, and the gateway client itself against a fake WebSocket gateway on 127.0.0.1"""
 
 import base64
+import email.parser
+import email.policy
 import hashlib
 import http.server
 import json
@@ -27,6 +29,7 @@ import aogowimsy as aw
 os.environ['no_proxy'] = os.environ['NO_PROXY'] = '127.0.0.1'  # the fakes, never through a proxy
 
 TOKEN = 'MTAwMDAw.fake-token_for.tests'
+PNG = b'\x89PNG\r\n\x1a\n a fake image'
 BOT, OWNER, FRIEND, STRANGER, OTHER_PERSON = (f'10000000000000000{n:02d}' for n in (1, 2, 3, 4, 5))
 GUILD = '200000000000000001'
 GENERAL, HELP, OTHER, THREAD, OTHER_THREAD, NEW_THREAD = (f'3000000000000000{n:02d}' for n in (1, 2, 3, 11, 12, 13))
@@ -79,6 +82,8 @@ class FakeDiscord:
         self.limits = []  # (method, path) answered 429 once each
         self.fail = {}  # (method, path): (status, body), answered until removed
         self.gateway_url = 'ws://127.0.0.1:9/'
+        self.origin = 'http://127.0.0.1:9'  # the fake's own address, where its attachments are served
+        self.blobs = {}  # an attachment's path: its bytes, as the CDN serves them
         self.serial = 1_500_000_000_000_000_000
         self.lock = threading.Lock()
 
@@ -187,6 +192,10 @@ class FakeDiscord:
         return 200, [self.render(m) for m in reversed(chosen)], {}
 
     def create(self, query, body, channel):
+        files = body.pop('_files', [])
+        listed = body.get('attachments')
+        if files and [item.get('id') for item in listed or []] != list(range(len(files))):
+            return 400, {'code': 50035, 'message': 'Invalid Form Body', 'errors': {'attachments': {}}}, {}
         content = body.get('content', '')
         if len(content) > 2000:
             message = 'Must be 2000 or fewer in length.'
@@ -198,6 +207,13 @@ class FakeDiscord:
         number = self.say(
             channel, BOT, content, reply_to=reference and reference['message_id'], embeds=body.get('embeds', [])
         )
+        kept = []
+        for place, (name, data, kind) in enumerate(files):
+            path = f'/attachments/{channel}/{number}{place}/{urllib.parse.quote(name)}'
+            self.blobs[path] = (data, kind)
+            kept.append({'id': f'{number}{place}', 'filename': name, 'size': len(data), 'url': self.origin + path})
+            kept[-1]['content_type'] = kind
+        self.find(channel, number)['attachments'] = kept
         if reference:
             self.find(channel, number)['message_reference'] = reference
         return 200, self.render(self.find(channel, number)), {}
@@ -223,12 +239,39 @@ class FakeDiscord:
         return 200, [self.users[u] for u in self.reactions.get(message, {}).get(emoji, [])], {}
 
 
+def form_body(kind, raw):
+    """Discord's multipart form: payload_json's JSON, with its files[n] as _files [(name, bytes, type)]"""
+    message = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+        f'Content-Type: {kind}\r\n\r\n'.encode() + raw
+    )
+    body, files = None, []
+    for part in message.iter_parts():
+        name = part.get_param('name', header='content-disposition')
+        if name == 'payload_json':
+            body = json.loads(part.get_content())
+        else:
+            assert name == f'files[{len(files)}]', name
+            files.append((part.get_filename(), part.get_payload(decode=True), part.get_content_type()))
+    return dict(body, _files=files)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def answer(self):
         parts = urllib.parse.urlsplit(self.path)
+        if parts.path in self.server.fake.blobs:  # the CDN: no token
+            data, kind = self.server.fake.blobs[parts.path]
+            self.server.fake.requests.append(('CDN', parts.path, {}, self.headers.get('Authorization')))
+            self.send_response(200)
+            self.send_header('Content-Type', kind)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+            return
         query = dict(urllib.parse.parse_qsl(parts.query))
         length = int(self.headers.get('Content-Length') or 0)
-        body = json.loads(self.rfile.read(length)) if length else None
+        raw = self.rfile.read(length) if length else b''
+        kind = self.headers.get('Content-Type') or ''
+        body = form_body(kind, raw) if kind.startswith('multipart/form-data') else json.loads(raw) if raw else None
         status, said, extra = self.server.fake.handle(
             self.command, urllib.parse.unquote(parts.path), query, body, self.headers
         )
@@ -372,6 +415,7 @@ class WithDiscord(unittest.TestCase):
 
     def setUp(self):
         self.fake = self.http.fake = FakeDiscord()
+        self.fake.origin = f'http://127.0.0.1:{self.http.server_port}'
         self.clock = FakeClock()
         self.settings = aw.Settings(TOKEN, OWNER, frozenset({FRIEND}), frozenset({GENERAL, HELP}))
         self.api = f'http://127.0.0.1:{self.http.server_port}/api/v10'
@@ -479,6 +523,64 @@ class Post(WithDiscord):
         again = self.tool('discord_post_status', draft=draft)
         self.assertEqual(again, sent)
         self.assertEqual(len(self.fake.messages[GENERAL]), 1)
+
+    def image(self, name, data=PNG):
+        folder = tempfile.TemporaryDirectory(prefix='aogowimsy-')
+        self.addCleanup(folder.cleanup)
+        path = Path(folder.name) / name
+        path.write_bytes(data)
+        return str(path)
+
+    def test_images_go_with_the_draft_and_with_the_post(self):
+        shots = [self.image('menu before-after.png'), self.image('b.JPG', b'\xff\xd8\xff jpeg')]
+        self.owner_answers(3, YES)
+        got = self.tool('discord_post', channel=GENERAL, text='the menu', files=shots)
+        draft, posted = self.fake.last(DM), self.fake.last(GENERAL)
+        self.assertEqual(got['status'], 'sent')
+        for message in (draft, posted):
+            names = [(a['filename'], a['content_type']) for a in message['attachments']]
+            self.assertEqual(names, [('menu before-after.png', 'image/png'), ('b.JPG', 'image/jpeg')])
+        self.assertEqual(self.fake.blobs[urllib.parse.urlsplit(posted['attachments'][0]['url']).path][0], PNG)
+        self.assertEqual(posted['content'], 'the menu')
+        # the post's images come from the draft, fetched from the CDN without the token
+        fetched = [r for r in self.fake.requests if r[0] == 'CDN']
+        self.assertEqual(
+            [(r[1].rsplit('/', 1)[1], r[3]) for r in fetched], [('menu%20before-after.png', None), ('b.JPG', None)]
+        )
+
+    def test_a_restart_keeps_the_drafts_images(self):
+        draft = self.tool('discord_post', channel=GENERAL, text='later', files=[self.image('a.webp', b'RIFF webp')])
+        fresh = aw.AogoWimsy(self.settings, aw.Discord(TOKEN, self.clock, self.api), self.clock)
+        self.server = self.started_server(fresh)
+        self.fake.react(draft['draft'], YES, OWNER)
+        self.assertEqual(self.tool('discord_post_status', draft=draft['draft'])['status'], 'sent')
+        self.assertEqual([a['filename'] for a in self.fake.last(GENERAL)['attachments']], ['a.webp'])
+
+    def test_files_are_checked_before_discord_hears_of_them(self):
+        png = self.image('a.png')
+        cases = (
+            ('a.png', 'files is a JSON string, not a list of 1 to 4 absolute paths of images'),
+            ([], 'files is empty: 1 to 4 absolute paths of images (png, jpg, jpeg, gif, webp)'),
+            ([png] * 5, 'files names 5 files: a post carries 1 to 4 images'),
+            (['a.png'], 'files item 1 is "a.png", not an absolute path'),
+            ([png + '.gone.png'], f'files item 1 is {png}.gone.png, which cannot be read: '),
+            ([self.image('log.txt')], 'files item 1 is a .txt: AogoWimsy posts images (png, jpg, jpeg, gif, webp)'),
+            ([self.image('empty.png', b'')], 'files item 1, '),
+        )
+        for files, said in cases:
+            with self.subTest(files=files):
+                self.assertIn(said, self.error('discord_post', channel=GENERAL, text='x', files=files))
+        self.assertIn(
+            'is empty', self.error('discord_post', channel=GENERAL, text='x', files=[self.image('e.gif', b'')])
+        )
+        self.assertEqual(self.fake.messages[DM], [])
+
+    def test_a_download_from_anywhere_but_discord_is_refused(self):
+        discord = aw.Discord(TOKEN, self.clock, self.api)
+        for url in ('https://example.com/a.png', 'http://cdn.discordapp.com/a.png', 'file:///etc/passwd'):
+            with self.subTest(url=url), self.assertRaises(aw.DiscordError) as caught:
+                discord.download(url)
+            self.assertIn(url, str(caught.exception))
 
     def test_a_restart_loses_no_draft_the_draft_is_the_state(self):
         draft = self.tool('discord_post', channel=GENERAL, text='after a restart', wait=0)['draft']
