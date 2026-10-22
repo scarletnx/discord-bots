@@ -81,8 +81,9 @@ METHODS = ('initialize', 'ping', 'tools/list', 'tools/call')
 CAPABILITIES = {'tools': {}, 'experimental': {'claude/channel': {}}}
 CHANNEL_PUSH = 'notifications/claude/channel'
 # The gateway's intents: GUILDS (1), GUILD_MESSAGES (512), GUILD_MESSAGE_REACTIONS (1024), DIRECT_MESSAGES (4096),
-# MESSAGE_CONTENT (32768, privileged: the Developer Portal's Message Content Intent)
-INTENTS = 1 | 1 << 9 | 1 << 10 | 1 << 12 | 1 << 15
+# DIRECT_MESSAGE_REACTIONS (8192: the owner's check mark on a draft, which is in his DMs), MESSAGE_CONTENT (32768,
+# privileged: the Developer Portal's Message Content Intent)
+INTENTS = 1 | 1 << 9 | 1 << 10 | 1 << 12 | 1 << 13 | 1 << 15
 GATEWAY_STOPS = {  # close codes after which Discord takes no new try: AogoWimsy stops hearing and says why
     4004: "authentication failed: AOGOWIMSY_TOKEN is not the bot's token",
     4010: 'invalid shard',

@@ -173,7 +173,8 @@ One application each, in the Developer Portal (Xuji can be an existing Grok bot)
 1. Bot: reset the token, put it in the env file; turn on **Message Content Intent** (without it, the messages
    AogoWimsy reads come with no text, and its gateway closes with 4014). AogoWimsy: its name and avatar are set there
    too, and **Public Bot** is off, so only its owner adds it to a server. Its gateway asks for the intents GUILDS,
-   GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS, DIRECT_MESSAGES and MESSAGE_CONTENT (38401); only the last is privileged.
+   GUILD_MESSAGES, GUILD_MESSAGE_REACTIONS, DIRECT_MESSAGES, DIRECT_MESSAGE_REACTIONS (the owner's answer to a draft,
+   in his DMs) and MESSAGE_CONTENT (46593); only the last is privileged.
 2. About me: what it does and that it keeps nothing (Xuji: that it is Grok, via xAI, for its owner alone; AogoWimsy:
    that it is Aogo, a Claude Code session, and posts only what its owner approved).
 3. Invite (OAuth2, scope `bot`), with only what it needs:
