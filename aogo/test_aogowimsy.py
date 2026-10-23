@@ -1361,8 +1361,10 @@ class GatewayClient(WithDiscord):
     def test_identify_with_its_intents_then_heartbeats_carrying_the_last_seq(self):
         _, identify = self.gateway.next(op(2))
         self.assertEqual(identify['d']['token'], TOKEN)
-        self.assertEqual(identify['d']['intents'], 38401)
-        self.assertEqual(aw.INTENTS, 1 + 512 + 1024 + 4096 + 32768)
+        self.assertEqual(identify['d']['intents'], 46593)
+        # 8192, DIRECT_MESSAGE_REACTIONS: without it Discord sends no reaction in the owner's DMs, and a draft he
+        # answered waited for a tool's next look
+        self.assertEqual(aw.INTENTS, 1 + 512 + 1024 + 4096 + 8192 + 32768)
         self.assertEqual(identify['d']['properties']['browser'], 'aogowimsy')
         self.assertEqual(self.kind('READY')['session_id'], 'fake-session')
         self.gateway.dispatch('MESSAGE_CREATE', {'id': '1', 'content': 'x'})
