@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include "link.h"
+#include "cards.h"
 #include "look.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -138,42 +139,31 @@ cJSON* lk_reply(const cJSON* const* items, int n) {
     buf_free(&b);
     return e;
 }
-static void size(Buf* b, double count) {
-    if (count >= 1048576)
-        buf_printf(b, "%.0f MiB", count / 1048576);
-    else
-        buf_printf(b, "%.0f KiB", (count < 1 ? 1 : count) / 1024);
-}
-static int by_name(const void* a, const void* b) {
-    const char *x = jstr(*(const cJSON* const*)a, "name"), *y = jstr(*(const cJSON* const*)b, "name");
-    return strcmp(x ? x : "", y ? y : "");
-}
-cJSON* lk_build(const cJSON* release, const char* said) {
-    const cJSON *assets = cJSON_GetObjectItemCaseSensitive(release, "assets"), *a;
-    int n = cJSON_GetArraySize(assets), i = 0;
-    const cJSON** files = malloc((size_t)(n ? n : 1) * sizeof *files);
-    Buf b = {0};
-    cJSON* e;
+cJSON* lk_build(const cJSON* release, const char* said, const char* repo) {
+    cJSON *fields = cJSON_CreateArray(), *e;
     const char* name = jstr(release, "name");
-    char* title;
-    cJSON_ArrayForEach(a, assets) files[i++] = a;
-    qsort(files, (size_t)n, sizeof *files, by_name);
+    char *title, *mascot = cd_mascot(repo);
+    int n = cd_downloads(fields, release);
+    Buf b = {0};
     if (said && *said) buf_add(&b, said);
-    for (i = 0; i < n && i < LK_FILES; ++i) {
-        if (b.len) buf_add(&b, "\n");
-        buf_printf(&b, "[%s](%s) (", jstr(files[i], "name"), jstr(files[i], "browser_download_url"));
-        size(&b, jnum(files[i], "size"));
-        buf_add(&b, ")");
-    }
-    if (n > LK_FILES) buf_printf(&b, "\nand %d more on its page", n - LK_FILES);
     if (!n) buf_printf(&b, "%sNo downloads on it yet.", b.len ? "\n" : "");
-    free(files);
-    e = embed(b.text, jbool(release, "prerelease") ? GREY : REI_OPEN);
+    if (b.len)
+        e = embed(b.text, jbool(release, "prerelease") ? GREY : REI_OPEN);
+    else { /* the fields alone: Discord takes no empty description */
+        e = cJSON_CreateObject();
+        cJSON_AddNumberToObject(e, "color", jbool(release, "prerelease") ? GREY : REI_OPEN);
+    }
     buf_free(&b);
     title = letters(name && *name ? name : jstr(release, "tag_name") ? jstr(release, "tag_name") : "", 256);
     cJSON_AddStringToObject(e, "title", title);
     jset(e, "url", jstr(release, "html_url"));
+    cJSON_AddStringToObject(cJSON_AddObjectToObject(e, "thumbnail"), "url", mascot);
+    if (n)
+        cJSON_AddItemToObject(e, "fields", fields);
+    else
+        cJSON_Delete(fields);
     free(title);
+    free(mascot);
     return e;
 }
 cJSON* lk_note(const char* text) { return embed(text, GREY); }
@@ -182,14 +172,14 @@ static cJSON* command(Link* l, int kind, int number) {
     const cJSON *found, *newest;
     if (kind == REI_NIGHTLY) {
         found = lk_release(l, l->gh->nightly, "latest");
-        return found ? lk_build(found, NULL) : lk_note("No nightly is published yet.");
+        return found ? lk_build(found, NULL, l->gh->repo) : lk_note("No nightly is published yet.");
     }
     if (kind == REI_RELEASE_PR) {
         char *tag = rei_format("tags/pr-%d", number), *missing;
         cJSON* e;
         found = lk_release(l, l->gh->nightly, tag);
         free(tag);
-        if (found) return lk_build(found, NULL);
+        if (found) return lk_build(found, NULL, l->gh->repo);
         missing =
             rei_format("No builds for #%d: a pull request has them while it is open and its last push built.", number);
         e = lk_note(missing);
@@ -197,9 +187,9 @@ static cJSON* command(Link* l, int kind, int number) {
         return e;
     }
     found = lk_release(l, l->gh->repo, "latest");
-    if (found) return lk_build(found, NULL);
+    if (found) return lk_build(found, NULL, l->gh->repo);
     newest = lk_release(l, l->gh->nightly, "latest");
-    if (newest) return lk_build(newest, "No version is released yet. The newest nightly:");
+    if (newest) return lk_build(newest, "No version is released yet. The newest nightly:", l->gh->repo);
     return lk_note("No version and no nightly are published yet.");
 }
 cJSON* lk_answer(Link* l, const char* text, int numbers[REI_MOST], int* n) {

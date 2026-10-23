@@ -81,6 +81,11 @@ void cd_round(Cards* c);
 cJSON* cd_pr(Cards* c, int number, int* open, double* closed_at);
 cJSON* cd_issue(Cards* c, int number, int* open, double* closed_at);
 cJSON* cd_nightly(Cards* c, const char* sha);
+/* a field per release file the cards list that release has, in their order (its kind linked, its size): a nightly's
+   or a version's downloads as a command's answer shows them. How many */
+int cd_downloads(cJSON* fields, const cJSON* release);
+/* the mascot beside each card, of the repository repo (OWNER/NAME): owned */
+char* cd_mascot(const char* repo);
 /* the hash of an embed without its time, as hex */
 void cd_hash(const cJSON* embed, char out[17]);
 

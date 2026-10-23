@@ -14,7 +14,6 @@
 #define LK_AGE     (7 * 86400)
 #define LK_TRACK   200
 #define LK_REFRESH 600 /* seconds between two looks at what the kept replies link */
-#define LK_FILES   12  /* a release's downloads a reply lists */
 
 typedef struct {
     int number;
@@ -51,7 +50,8 @@ const cJSON* lk_release(Link* l, const char* repo, const char* which);
 
 /* the embeds a reply carries, as Discord takes them; owned */
 cJSON* lk_reply(const cJSON* const* items, int n);
-cJSON* lk_build(const cJSON* release, const char* said);
+/* a release's downloads as the cards show them, said over them, the mascot of repo beside them */
+cJSON* lk_build(const cJSON* release, const char* said, const char* repo);
 cJSON* lk_note(const char* text);
 /* the reply to a message's text: a command's embed, else the one of the items it names (numbers[] and *n theirs,
    for lk_keep); NULL when it asks for nothing GitHub has. Owned */
