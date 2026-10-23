@@ -63,7 +63,10 @@ if [ "$(cat "$root$concord/VERSION" 2>/dev/null)" != "$build" ]; then
 		done
 		: > "$root$src/.patched"
 	fi
-	jexec "$jail" sh -c "cd $src && gmake && gmake -C test $CONCORD_TESTS"
+	# its tests link libcurl, which FreeBSD keeps under /usr/local: pkg-config says where (the library's own Makefile
+	# adds /usr/local/include, its tests' does not)
+	jexec "$jail" sh -c "cd $src && gmake && CFLAGS=\"\$(pkg-config --cflags libcurl)\" gmake -C test $CONCORD_TESTS \
+		LDLIBS=\"-ldiscord \$(pkg-config --libs libcurl)\""
 	for t in $CONCORD_TESTS; do
 		jexec "$jail" sh -c "cd $src/test && ./$t > $t.log 2>&1" || {
 			echo "Concord's $t failed in $src/test; the end of its $t.log:" >&2
