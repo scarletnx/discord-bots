@@ -81,9 +81,12 @@ void cd_round(Cards* c);
 cJSON* cd_pr(Cards* c, int number, int* open, double* closed_at);
 cJSON* cd_issue(Cards* c, int number, int* open, double* closed_at);
 cJSON* cd_nightly(Cards* c, const char* sha);
-/* a field per release file the cards list that release has, in their order (its kind linked, its size): a nightly's
-   or a version's downloads as a command's answer shows them. How many */
-int cd_downloads(cJSON* fields, const cJSON* release);
+/* the application's emojis (Discord's list of them), each package's icon from now on; one a package lacks is said,
+   and its lines go without it */
+void cd_icons(const cJSON* emojis);
+/* a line per release file the cards list that release has, in their order, onto b: its icon, its system and its
+   extension linked; a nightly's or a version's downloads as a command's answer shows them. How many */
+int cd_downloads(Buf* b, const cJSON* release);
 /* the mascot beside each card, of the repository repo (OWNER/NAME): owned */
 char* cd_mascot(const char* repo);
 /* the hash of an embed without its time, as hex */

@@ -28,22 +28,28 @@
 #define LABEL        "publish builds"
 
 /* each release file, in the order the cards list them: the job of ScarletNX's build.yml that makes it (macOS's and
-   iOS's share one runner), and what it is for, as scripts/nightly-notes.py's SYSTEMS has it */
+   iOS's share one runner), what it is for, as scripts/nightly-notes.py's SYSTEMS has it, what it holds where that is
+   not all, and the application's emoji beside it (Wimsy as its system, scarletnx/wimsy-dist's emoji/) */
 static const struct {
-    const char *file, *job, *system, *arch, *kind;
+    const char *file, *job, *system, *arch, *note, *icon;
 } PACKAGES[] = {
-    {"ScarletNX-linux-x86_64.AppImage", "Linux AppImage (x86_64)", "Linux", "x86-64", "AppImage"},
-    {"ScarletNX-linux-aarch64.AppImage", "Linux AppImage (aarch64)", "Linux", "ARM64", "AppImage"},
-    {"ScarletNX-linux-ppc64le.AppImage", "Linux AppImage (ppc64le)", "Linux", "PowerPC64 LE", "AppImage"},
-    {"ScarletNX-linux-ppc64.AppImage", "Linux AppImage (ppc64)", "Linux", "PowerPC64 BE", "AppImage (Linux programs)"},
-    {"ScarletNX-linux-riscv64.AppImage", "Linux AppImage (riscv64)", "Linux", "RISC-V 64", "AppImage"},
-    {"ScarletNX-linux-loongarch64.AppImage", "Linux AppImage (loongarch64)", "Linux", "LoongArch64", "AppImage"},
-    {"ScarletNX-windows-x86_64.zip", "Windows (Clang + LLVM)", "Windows", "x86-64", "zip"},
-    {"ScarletNX-android-universal.apk", "Android APK", "Android", "ARM64, x86-64", "APK"},
-    {"ScarletNX-macos-arm64.zip", "macOS and iOS (arm64)", "macOS", "ARM64", "zip"},
-    {"ScarletNX-ios-arm64.ipa", "macOS and iOS (arm64)", "iOS", "ARM64", "IPA"},
+    {"ScarletNX-linux-x86_64.AppImage", "Linux AppImage (x86_64)", "Linux", "x86-64", "", "wimsy_linux"},
+    {"ScarletNX-linux-aarch64.AppImage", "Linux AppImage (aarch64)", "Linux", "ARM64", "", "wimsy_linux"},
+    {"ScarletNX-linux-ppc64le.AppImage", "Linux AppImage (ppc64le)", "Linux", "PowerPC64 LE", "", "wimsy_linux"},
+    {"ScarletNX-linux-ppc64.AppImage", "Linux AppImage (ppc64)", "Linux", "PowerPC64 BE", " (Linux programs)",
+     "wimsy_linux"},
+    {"ScarletNX-linux-riscv64.AppImage", "Linux AppImage (riscv64)", "Linux", "RISC-V 64", "", "wimsy_linux"},
+    {"ScarletNX-linux-loongarch64.AppImage", "Linux AppImage (loongarch64)", "Linux", "LoongArch64", "", "wimsy_linux"},
+    {"ScarletNX-windows-x86_64.zip", "Windows (Clang + LLVM)", "Windows", "x86-64", "", "wimsy_windows"},
+    {"ScarletNX-android-universal.apk", "Android APK", "Android", "ARM64, x86-64", "", "wimsy_android"},
+    {"ScarletNX-macos-arm64.zip", "macOS and iOS (arm64)", "macOS", "ARM64", "", "wimsy_macos"},
+    {"ScarletNX-ios-arm64.ipa", "macOS and iOS (arm64)", "iOS", "ARM64", "", "wimsy_ios"},
 };
 #define NPACKAGES (int)(sizeof PACKAGES / sizeof *PACKAGES)
+/* a field's value Discord takes, in letters */
+#define FIELD     1024
+/* each package's emoji as a message writes it, <:name:id>; "" until cd_icons found it */
+static char g_icons[NPACKAGES][64];
 /* Build's jobs that make no release file, shown after the packages: each job, as build.yml names it, and what it
    tests */
 static const struct {
@@ -290,13 +296,14 @@ static void listed(Buf* b, char** lines, int n, const char* more, int most) {
     for (i = 0; i < n && i < most; ++i) buf_printf(b, "\n- %s", lines[i]);
     if (n > most) buf_printf(b, "\n- and [%d more](%s)", n - most, more);
 }
-static void field(cJSON* fields, const char* name, const char* value) {
+static void field_of(cJSON* fields, const char* name, const char* value, int inline_) {
     cJSON* f = cJSON_CreateObject();
     cJSON_AddStringToObject(f, "name", name);
     cJSON_AddStringToObject(f, "value", value);
-    cJSON_AddBoolToObject(f, "inline", 1);
+    cJSON_AddBoolToObject(f, "inline", inline_);
     cJSON_AddItemToArray(fields, f);
 }
+static void field(cJSON* fields, const char* name, const char* value) { field_of(fields, name, value, 1); }
 static void capitalized(Buf* b, const char* word) {
     if (!*word) return;
     buf_printf(b, "%c%s", toupper((unsigned char)*word), word + 1);
@@ -306,61 +313,83 @@ static const cJSON* named(const cJSON* list, const char* key, const char* name) 
     cJSON_ArrayForEach(item, list) if (!strcmp(S(jstr(item, key)), name)) found = item; /* the last, as a dict keeps */
     return found;
 }
-/* package i's field's name: its system, and its architecture where it has one */
-static char* package_name(int i) {
-    return strchr(PACKAGES[i].arch, ',') ? rei_strdup(PACKAGES[i].system)
-                                         : rei_format("%s %s", PACKAGES[i].system, PACKAGES[i].arch);
+void cd_icons(const cJSON* emojis) {
+    int i, j;
+    for (i = 0; i < NPACKAGES; ++i) {
+        const cJSON* emoji = named(emojis, "name", PACKAGES[i].icon);
+        g_icons[i][0] = 0;
+        if (emoji && jstr(emoji, "id"))
+            snprintf(g_icons[i], sizeof g_icons[i], "<:%s:%s>", PACKAGES[i].icon, jstr(emoji, "id"));
+        for (j = 0; j < i && strcmp(PACKAGES[j].icon, PACKAGES[i].icon); ++j) {}
+        if (!*g_icons[i] && j == i) /* each emoji said once, though Linux's has six packages */
+            rei_log("Discord: the application has no emoji %s: the %s downloads go without their icon",
+                    PACKAGES[i].icon, PACKAGES[i].system);
+    }
 }
-/* package i published as asset: its kind linked, and its size */
+/* package i's line: its icon, its system and its architecture where it has one, then what */
+static void line_of(Buf* b, int i, const char* what) {
+    if (*g_icons[i]) buf_printf(b, "%s ", g_icons[i]);
+    buf_add(b, PACKAGES[i].system);
+    if (!strchr(PACKAGES[i].arch, ',')) buf_printf(b, " %s", PACKAGES[i].arch);
+    buf_printf(b, ": %s", what);
+}
+/* package i published as asset: its extension linked, and what it holds where that is not all */
 static void published(Buf* v, int i, const cJSON* asset) {
-    buf_printf(v, "[%s](%s)\n%.1f MB", PACKAGES[i].kind, S(jstr(asset, "browser_download_url")),
-               jnum(asset, "size") / 1e6);
+    buf_printf(v, "[%s](%s)%s", strrchr(PACKAGES[i].file, '.'), S(jstr(asset, "browser_download_url")),
+               PACKAGES[i].note);
 }
-int cd_downloads(cJSON* fields, const cJSON* release) {
+int cd_downloads(Buf* b, const cJSON* release) {
     int i, n = 0;
     for (i = 0; i < NPACKAGES; ++i) {
         const cJSON* asset = named(cJSON_GetObjectItemCaseSensitive(release, "assets"), "name", PACKAGES[i].file);
         Buf v = {0};
-        char* name;
         if (!asset) continue;
         published(&v, i, asset);
-        name = package_name(i);
-        field(fields, name, v.text);
-        free(name);
+        if (b->len) buf_add(b, "\n");
+        line_of(b, i, v.text);
         buf_free(&v);
         ++n;
     }
     return n;
 }
 char* cd_mascot(const char* repo) { return rei_format(WIMSY, repo); }
-/* a field per release file: published, its link and size; else what its job does; built: what a built one waits for.
-   Then a field per job of CHECKS: what its tests did */
+/* a line per release file, in Downloads fields as many as Discord's FIELD letters take: published, its extension
+   linked; else what its job does; built: what a built one waits for. Then a field per job of CHECKS: what its tests
+   did */
 static void packages(cJSON* fields, const cJSON* jobs, const cJSON* release, const char* built) {
+    Buf lines = {0};
     int i;
     for (i = 0; i < NPACKAGES; ++i) {
         const cJSON *job = named(jobs, "name", PACKAGES[i].job),
                     *asset = named(cJSON_GetObjectItemCaseSensitive(release, "assets"), "name", PACKAGES[i].file);
         const char *status = S(jstr(job, "status")), *conclusion = S(jstr(job, "conclusion"));
-        Buf v = {0};
-        char* name;
+        Buf v = {0}, one = {0};
         if (asset)
             published(&v, i, asset);
         else if (!job || !strcmp(status, "queued") || !strcmp(status, "waiting") || !strcmp(status, "pending") ||
                  !strcmp(status, "requested"))
             buf_add(&v, "Waiting");
         else if (strcmp(status, "completed"))
-            buf_printf(&v, "Building\n[log](%s)", S(jstr(job, "html_url")));
+            buf_printf(&v, "Building ([log](%s))", S(jstr(job, "html_url")));
         else if (!strcmp(conclusion, "success"))
-            buf_printf(&v, built && *built ? "Built\n%s" : "Built", S(built));
+            buf_printf(&v, built && *built ? "Built, %s" : "Built", S(built));
         else if (!strcmp(conclusion, "cancelled") || !strcmp(conclusion, "skipped"))
             capitalized(&v, conclusion);
         else
-            buf_printf(&v, "Failed\n[log](%s)", S(jstr(job, "html_url")));
-        name = package_name(i);
-        field(fields, name, v.text);
-        free(name);
+            buf_printf(&v, "Failed ([log](%s))", S(jstr(job, "html_url")));
+        line_of(&one, i, v.text);
+        if (lines.len && rei_letters(lines.text) + 1 + rei_letters(one.text) > FIELD) { /* this field is full */
+            field_of(fields, "Downloads", lines.text, 0);
+            buf_free(&lines);
+            lines = (Buf){0};
+        }
+        if (lines.len) buf_add(&lines, "\n");
+        buf_add(&lines, one.text);
+        buf_free(&one);
         buf_free(&v);
     }
+    if (lines.len) field_of(fields, "Downloads", lines.text, 0);
+    buf_free(&lines);
     for (i = 0; i < NCHECKS; ++i) {
         const cJSON* job = named(jobs, "name", CHECKS[i].job);
         const char *status = S(jstr(job, "status")), *conclusion = S(jstr(job, "conclusion"));

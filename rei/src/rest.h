@@ -20,6 +20,8 @@ typedef struct {
 void dc_init(Dc* d, RgFetch fetch, void* ctx);
 /* the bot's user id, asked once; 0 when Discord did not say */
 u64 dc_self(Dc* d);
+/* the application's emojis (its bot's id is the application's), Discord's list of them; owned, or NULL, said */
+cJSON* dc_emojis(Dc* d);
 /* embed posted in channel, a reply to message reply_to when not 0: the new message's id, or 0 (said in the log) */
 u64 dc_post(Dc* d, u64 channel, const cJSON* embed, u64 reply_to);
 /* 0 done, 404 when the message or its channel is gone, else Discord's status (-1 for no answer), said in the log */
