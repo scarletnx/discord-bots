@@ -48,13 +48,15 @@ static const struct {
 #define NPACKAGES (int)(sizeof PACKAGES / sizeof *PACKAGES)
 /* a field's value Discord takes, in letters */
 #define FIELD     1024
+/* the name of a list's fields after its first: a zero-width space, which Discord shows as none, so they read as one */
+#define GO_ON     "\xe2\x80\x8b"
 /* each package's emoji as a message writes it, <:name:id>; "" until cd_icons found it */
 static char g_icons[NPACKAGES][64];
-/* Build's jobs that make no release file, shown after the packages: each job, as build.yml names it, and what it
-   tests */
+/* Build's jobs that make no release file whose state Tests always says: each job, as build.yml names it, and what it
+   tests. The others are said when they fail */
 static const struct {
-    const char *job, *field;
-} CHECKS[] = {{"Linux (ppc64, cross)", "Linux PowerPC64 BE ELFv1 tests"}};
+    const char *job, *label;
+} CHECKS[] = {{"Linux (ppc64, cross)", "Linux PowerPC64 BE ELFv1"}};
 #define NCHECKS (int)(sizeof CHECKS / sizeof *CHECKS)
 
 static const char* S(const char* s) { return s ? s : ""; }
@@ -304,6 +306,25 @@ static void field_of(cJSON* fields, const char* name, const char* value, int inl
     cJSON_AddItemToArray(fields, f);
 }
 static void field(cJSON* fields, const char* name, const char* value) { field_of(fields, name, value, 1); }
+/* a list of lines in fields of FIELD letters at most, the first named name and the others GO_ON */
+typedef struct {
+    cJSON* fields;
+    const char* name;
+    Buf lines;
+} Lines;
+static void lines_end(Lines* l) {
+    if (l->lines.len) field_of(l->fields, l->name, l->lines.text, 0);
+    buf_free(&l->lines);
+    l->lines = (Buf){0};
+}
+static void lines_add(Lines* l, const char* line) {
+    if (l->lines.len && rei_letters(l->lines.text) + 1 + rei_letters(line) > FIELD) { /* this field is full */
+        lines_end(l);
+        l->name = GO_ON;
+    }
+    if (l->lines.len) buf_add(&l->lines, "\n");
+    buf_add(&l->lines, line);
+}
 static void capitalized(Buf* b, const char* word) {
     if (!*word) return;
     buf_printf(b, "%c%s", toupper((unsigned char)*word), word + 1);
@@ -325,6 +346,24 @@ void cd_icons(const cJSON* emojis) {
             rei_log("Discord: the application has no emoji %s: the %s downloads go without their icon",
                     PACKAGES[i].icon, PACKAGES[i].system);
     }
+}
+/* the emoji cd_icons found for the system name names first (Linux, Windows...), as a job's name or a check's;
+   "" for none */
+static const char* icon_of(const char* name) {
+    const char *first = NULL, *icon = "";
+    int i;
+    for (i = 0; i < NPACKAGES; ++i) {
+        const char* at = strstr(name, PACKAGES[i].system);
+        if (at && (!first || at < first)) {
+            first = at;
+            icon = g_icons[i];
+        }
+    }
+    return icon;
+}
+/* a job's failure as a conclusion says it; not a cancelled or skipped one */
+static int failure(const char* conclusion) {
+    return !strcmp(conclusion, "failure") || !strcmp(conclusion, "timed_out") || !strcmp(conclusion, "startup_failure");
 }
 /* package i's line: its icon, its system and its architecture where it has one, then what */
 static void line_of(Buf* b, int i, const char* what) {
@@ -353,17 +392,20 @@ int cd_downloads(Buf* b, const cJSON* release) {
     return n;
 }
 char* cd_mascot(const char* repo) { return rei_format(WIMSY, repo); }
-/* a line per release file, in Downloads fields as many as Discord's FIELD letters take: published, its extension
-   linked; else what its job does; built: what a built one waits for. Then a field per job of CHECKS: what its tests
-   did */
+/* a line per release file in Downloads: published, its extension linked; else what its job does; built: what a built
+   one waits for. Then in Tests a line per job of CHECKS, what its tests did, and one per other job that makes no file
+   and failed */
 static void packages(cJSON* fields, const cJSON* jobs, const cJSON* release, const char* built) {
-    Buf lines = {0};
+    Lines downloads = {fields, "Downloads", {0}}, tests = {fields, "Tests", {0}};
+    const cJSON* job;
     int i;
     for (i = 0; i < NPACKAGES; ++i) {
-        const cJSON *job = named(jobs, "name", PACKAGES[i].job),
-                    *asset = named(cJSON_GetObjectItemCaseSensitive(release, "assets"), "name", PACKAGES[i].file);
-        const char *status = S(jstr(job, "status")), *conclusion = S(jstr(job, "conclusion"));
+        const cJSON* asset = named(cJSON_GetObjectItemCaseSensitive(release, "assets"), "name", PACKAGES[i].file);
+        const char *status, *conclusion;
         Buf v = {0}, one = {0};
+        job = named(jobs, "name", PACKAGES[i].job);
+        status = S(jstr(job, "status"));
+        conclusion = S(jstr(job, "conclusion"));
         if (asset)
             published(&v, i, asset);
         else if (!job || !strcmp(status, "queued") || !strcmp(status, "waiting") || !strcmp(status, "pending") ||
@@ -378,36 +420,46 @@ static void packages(cJSON* fields, const cJSON* jobs, const cJSON* release, con
         else
             buf_printf(&v, "Failed ([log](%s))", S(jstr(job, "html_url")));
         line_of(&one, i, v.text);
-        if (lines.len && rei_letters(lines.text) + 1 + rei_letters(one.text) > FIELD) { /* this field is full */
-            field_of(fields, "Downloads", lines.text, 0);
-            buf_free(&lines);
-            lines = (Buf){0};
-        }
-        if (lines.len) buf_add(&lines, "\n");
-        buf_add(&lines, one.text);
+        lines_add(&downloads, one.text);
         buf_free(&one);
         buf_free(&v);
     }
-    if (lines.len) field_of(fields, "Downloads", lines.text, 0);
-    buf_free(&lines);
+    lines_end(&downloads);
     for (i = 0; i < NCHECKS; ++i) {
-        const cJSON* job = named(jobs, "name", CHECKS[i].job);
-        const char *status = S(jstr(job, "status")), *conclusion = S(jstr(job, "conclusion"));
-        Buf v = {0};
+        const char *status, *conclusion, *icon = icon_of(CHECKS[i].label);
+        Buf one = {0};
+        job = named(jobs, "name", CHECKS[i].job);
+        status = S(jstr(job, "status"));
+        conclusion = S(jstr(job, "conclusion"));
+        if (*icon) buf_printf(&one, "%s ", icon);
+        buf_printf(&one, "%s: ", CHECKS[i].label);
         if (!job || !strcmp(status, "queued") || !strcmp(status, "waiting") || !strcmp(status, "pending") ||
             !strcmp(status, "requested"))
-            buf_add(&v, "Waiting");
+            buf_add(&one, "Waiting");
         else if (strcmp(status, "completed"))
-            buf_printf(&v, "Testing\n[log](%s)", S(jstr(job, "html_url")));
+            buf_printf(&one, "Testing ([log](%s))", S(jstr(job, "html_url")));
         else if (!strcmp(conclusion, "success"))
-            buf_add(&v, "Tests passed");
+            buf_add(&one, "Passed");
         else if (!strcmp(conclusion, "cancelled") || !strcmp(conclusion, "skipped"))
-            capitalized(&v, conclusion);
+            capitalized(&one, conclusion);
         else
-            buf_printf(&v, "Tests failed\n[log](%s)", S(jstr(job, "html_url")));
-        field(fields, CHECKS[i].field, v.text);
-        buf_free(&v);
+            buf_printf(&one, "Failed ([log](%s))", S(jstr(job, "html_url")));
+        lines_add(&tests, one.text);
+        buf_free(&one);
     }
+    cJSON_ArrayForEach(job, jobs) {
+        const char* name = S(jstr(job, "name"));
+        int listed = 0;
+        Buf one = {0};
+        for (i = 0; i < NPACKAGES; ++i) listed |= !strcmp(name, PACKAGES[i].job);
+        for (i = 0; i < NCHECKS; ++i) listed |= !strcmp(name, CHECKS[i].job);
+        if (listed || strcmp(S(jstr(job, "status")), "completed") || !failure(S(jstr(job, "conclusion")))) continue;
+        if (*icon_of(name)) buf_printf(&one, "%s ", icon_of(name));
+        buf_printf(&one, "%s: Failed ([log](%s))", name, S(jstr(job, "html_url")));
+        lines_add(&tests, one.text);
+        buf_free(&one);
+    }
+    lines_end(&tests);
 }
 static int failed_jobs(const cJSON* jobs) {
     const cJSON* j;
@@ -568,29 +620,11 @@ cJSON* cd_pr(Cards* c, int number, int* open, double* closed_at) {
             if (!suffix(c->builds, mine)) c->builds[0] = 0; /* another push's */
             free(mine);
         }
-        if (!run)
-            buf_add(&v, "Not started");
-        else if (strcmp(S(jstr(run, "status")), "completed"))
-            buf_printf(&v, "[Running](%s)", S(jstr(run, "html_url")));
-        else {
-            const char* conclusion = S(jstr(run, "conclusion"));
-            buf_add(&v, "[");
-            if (!strcmp(conclusion, "success"))
-                buf_add(&v, "Passed");
-            else
-                capitalized(&v, conclusion);
-            buf_printf(&v, "](%s)", S(jstr(run, "html_url")));
-        }
-        field(fields, "Build", v.text);
-        buf_free(&v);
-        if (current)
-            buf_printf(&v, "[All files](%s)", S(jstr(current, "html_url")));
-        else if (release)
+        if (!current && release) { /* this push's not published yet: the one before's, to take meanwhile */
             buf_printf(&v, "[The push before](%s)", S(jstr(release, "html_url")));
-        else
-            buf_add(&v, "None yet");
-        field(fields, "Builds", v.text);
-        buf_free(&v);
+            field(fields, "Builds", v.text);
+            buf_free(&v);
+        }
         color = draft ? REI_DRAFT : REI_OPEN;
         free(fork_name);
         free(built);

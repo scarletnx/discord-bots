@@ -793,7 +793,11 @@ static void pr_card(void) {
        "{\"name\":\"Linux AppImage (aarch64)\",\"status\":\"completed\",\"conclusion\":\"success\"},"
        "{\"name\":\"macOS and iOS (arm64)\",\"status\":\"queued\",\"html_url\":\"https://j/3\"},"
        "{\"name\":\"Linux (ppc64, cross)\",\"status\":\"completed\",\"conclusion\":\"failure\","
-       "\"html_url\":\"https://j/4\"}]}");
+       "\"html_url\":\"https://j/4\"},"
+       "{\"name\":\"Linux (x86_64, ASan + UBSan)\",\"status\":\"completed\",\"conclusion\":\"failure\","
+       "\"html_url\":\"https://j/5\"},"
+       "{\"name\":\"Linux (x86_64)\",\"status\":\"completed\",\"conclusion\":\"success\",\"html_url\":\"https://j/6\"},"
+       "{\"name\":\"edenprobe (Linux x86_64, lavapipe)\",\"status\":\"in_progress\",\"html_url\":\"https://j/7\"}]}");
     answer("POST", "https://api.github.com/graphql", 200,
            "{\"data\":{\"repository\":{\"pullRequest\":{\"closingIssuesReferences\":{\"nodes\":[]}}}}}");
     {
@@ -813,8 +817,10 @@ static void pr_card(void) {
         "on main at [`3333333`](https://github.com/o/r/commit/3333333333333333333333333333333333333333) "
         "([its nightly](https://n/1)).");
     HAS(text, "**2 commits**, the newest first\\n- \\\\[gpu\\\\] Second \\\\*one\\\\*\\n- \\\\[gpu\\\\] First");
-    /* a line a package in one Downloads field, its icon, then its link or its job's state; the jobs that make no
-       file after it, what their tests did */
+    /* a line a package in one Downloads field, its icon, then its link or its job's state; then in Tests the jobs
+       of CHECKS, what their tests did, and the other jobs that make no file and failed, not those running or passed,
+       each with the icon of the system its name names.
+       No Build field (each job has its line) and no Builds while this push's are published (each has its link) */
     HAS(text,
         "{\"name\":\"Downloads\",\"value\":\"<:wimsy_linux:11> Linux x86-64: Building ([log](https://j/1))\\n"
         "<:wimsy_linux:11> Linux ARM64: Built, being published\\n<:wimsy_linux:11> Linux PowerPC64 LE: Waiting\\n"
@@ -823,14 +829,68 @@ static void pr_card(void) {
         "<:wimsy_windows:22> Windows x86-64: [.zip](https://n/w)\\n"
         "<:wimsy_android:33> Android: Failed ([log](https://j/2))\\n"
         "<:wimsy_macos:44> macOS ARM64: Waiting\\n<:wimsy_ios:55> iOS ARM64: Waiting\",\"inline\":false},"
-        "{\"name\":\"Linux PowerPC64 BE ELFv1 tests\",\"value\":\"Tests failed\\n[log](https://j/4)\",\"inline\":true},"
-        "{\"name\":\"Build\"");
-    CHECK(!strstr(text, " MB"));
-    HAS(text, "{\"name\":\"Build\",\"value\":\"[Running](https://r/9)\",\"inline\":true}");
-    HAS(text, "{\"name\":\"Builds\",\"value\":\"[All files](https://n/pr-7)\",\"inline\":true}");
+        "{\"name\":\"Tests\",\"value\":\"<:wimsy_linux:11> Linux PowerPC64 BE ELFv1: Failed ([log](https://j/4))\\n"
+        "<:wimsy_linux:11> Linux (x86_64, ASan + UBSan): Failed ([log](https://j/5))\",\"inline\":false}");
+    CHECK(!strstr(text, " MB") && !strstr(text, "https://j/6") && !strstr(text, "https://j/7"));
+    CHECK(!strstr(text, "\"name\":\"Build\"") && !strstr(text, "\"name\":\"Builds\""));
     HAS(text, "\"color\":2066493"); /* GitHub's green: open */
     free(text);
     cJSON_Delete(e);
+    /* every package building, at Discord's own lengths (an emoji's id, a log's address): the lines in two fields
+       within FIELD letters each, the second named GO_ON (none shown) so they read as one; this push's builds not
+       published, the push before's linked */
+    {
+        static const char* const names[] = {"Linux AppImage (x86_64)",  "Linux AppImage (aarch64)",
+                                            "Linux AppImage (ppc64le)", "Linux AppImage (ppc64)",
+                                            "Linux AppImage (riscv64)", "Linux AppImage (loongarch64)",
+                                            "Windows (Clang + LLVM)",   "Android APK",
+                                            "macOS and iOS (arm64)"};
+        cJSON *emojis = cJSON_Parse("[{\"name\":\"wimsy_linux\",\"id\":\"1563256571297923183\"},"
+                                    "{\"name\":\"wimsy_windows\",\"id\":\"1563256573802057808\"},"
+                                    "{\"name\":\"wimsy_android\",\"id\":\"1563256568382759065\"},"
+                                    "{\"name\":\"wimsy_macos\",\"id\":\"1563256572677988502\"},"
+                                    "{\"name\":\"wimsy_ios\",\"id\":\"1563256569997557891\"}]"),
+              *f;
+        const cJSON *first = NULL, *second = NULL;
+        Buf jobs = {0};
+        int i, n = 0;
+        cd_icons(emojis);
+        cJSON_Delete(emojis);
+        buf_add(&jobs, "{\"jobs\":[");
+        for (i = 0; i < 9; ++i)
+            buf_printf(&jobs,
+                       "%s{\"name\":\"%s\",\"status\":\"in_progress\",\"html_url\":"
+                       "\"https://github.com/scarletnx/ScarletNX/actions/runs/40008179076/job/12060136688%d\"}",
+                       i ? "," : "", names[i], i);
+        buf_add(&jobs, "]}");
+        gh("repos/o/r/actions/runs/9/jobs?per_page=100&page=1", jobs.text);
+        buf_free(&jobs);
+        gh("repos/o/nightly/releases?per_page=100&page=1",
+           "[{\"tag_name\":\"pr-7\",\"html_url\":\"https://n/pr-7\",\"published_at\":\"2026-10-20T11:00:00Z\","
+           "\"body\":\"built from /commits/0000000000000000000000000000000000000000\",\"assets\":[]}]");
+        cJSON_Delete(c.nightlies);
+        c.nightlies = NULL;
+        e = cd_pr(&c, 7, &open, &closed);
+        cJSON_ArrayForEach(f, cJSON_GetObjectItemCaseSensitive(e, "fields")) {
+            const char* name = cJSON_GetObjectItemCaseSensitive(f, "name")->valuestring;
+            if (!strcmp(name, "Downloads")) first = f;
+            if (!strcmp(name, "\xe2\x80\x8b")) second = f;
+            n += !strcmp(name, "Downloads") || !strcmp(name, "\xe2\x80\x8b");
+        }
+        CHECK(first && second && n == 2);
+        CHECK(rei_letters(cJSON_GetObjectItemCaseSensitive(first, "value")->valuestring) <= 1024);
+        CHECK(rei_letters(cJSON_GetObjectItemCaseSensitive(second, "value")->valuestring) <= 1024);
+        CHECK(strstr(cJSON_GetObjectItemCaseSensitive(first, "value")->valuestring, "Linux LoongArch64: Building"));
+        {
+            const char* windows = "<:wimsy_windows:1563256573802057808> Windows x86-64: Building ([log](";
+            CHECK(!strncmp(cJSON_GetObjectItemCaseSensitive(second, "value")->valuestring, windows, strlen(windows)));
+        }
+        text = cJSON_PrintUnformatted(e);
+        HAS(text, "<:wimsy_linux:1563256571297923183> Linux PowerPC64 BE ELFv1: Waiting");
+        HAS(text, "{\"name\":\"Builds\",\"value\":\"[The push before](https://n/pr-7)\",\"inline\":true}");
+        free(text);
+        cJSON_Delete(e);
+    }
     /* what moves it to the end: its push's builds published or failed (not a job's progress, a run again or
        cancelled), a comment, a draft, a push; not a label */
     {
