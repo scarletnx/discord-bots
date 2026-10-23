@@ -320,11 +320,11 @@ static void link_tests(void) {
     "{\"name\":\"Nightly 2026-10-17 (44aa300)\",\"tag_name\":\"nightly-2026-10-17-44aa300\","                          \
     "\"html_url\":\"https://n/nightly-2026-10-17-44aa300\",\"prerelease\":false,\"assets\":["                          \
     "{\"name\":\"ScarletNX-windows-x86_64.zip\",\"size\":83886080,\"browser_download_url\":\"https://n/win\"},"        \
-    "{\"name\":\"ScarletNX-linux-x86_64.AppImage\",\"size\":52428800,\"browser_download_url\":\"https://n/lin\"}]}"
+    "{\"name\":\"ScarletNX-linux-x86_64.AppImage\",\"size\":52428800,\"browser_download_url\":\"https://n/lin\"},"     \
+    "{\"name\":\"ScarletNX-linux-x86_64.AppImage.zsync\",\"size\":156672,\"browser_download_url\":\"https://n/zs\"}]}"
 static void commands(void) {
     int numbers[REI_MOST], n;
     cJSON* e;
-    const char* d;
     link_start();
     gh("repos/o/nightly/releases/latest", NIGHTLY);
     gh("repos/o/nightly/releases/tags/pr-355",
@@ -334,9 +334,22 @@ static void commands(void) {
     CHECK(n == 0);
     SAME(jstr(e, "title"), "Nightly 2026-10-17 (44aa300)");
     SAME(jstr(e, "url"), "https://n/nightly-2026-10-17-44aa300");
-    d = jstr(e, "description");
-    HAS(d, "[ScarletNX-linux-x86_64.AppImage](https://n/lin) (50 MiB)");
-    CHECK(d && strstr(d, "linux") < strstr(d, "windows"));
+    /* the cards' look: a field a package, in their order, each its kind linked and its size; a file the cards do not
+       list (the AppImage's .zsync) left out; the mascot beside them */
+    {
+        const cJSON *fields = cJSON_GetObjectItemCaseSensitive(e, "fields"), *f0 = cJSON_GetArrayItem(fields, 0),
+                    *f1 = cJSON_GetArrayItem(fields, 1);
+        char* printed = cJSON_PrintUnformatted(e);
+        CHECK(cJSON_GetArraySize(fields) == 2 && !jstr(e, "description"));
+        SAME(jstr(f0, "name"), "Linux x86-64");
+        SAME(jstr(f0, "value"), "[AppImage](https://n/lin)\n52.4 MB");
+        SAME(jstr(f1, "name"), "Windows x86-64");
+        SAME(jstr(f1, "value"), "[zip](https://n/win)\n83.9 MB");
+        CHECK(printed && !strstr(printed, "zsync") && !strstr(printed, "https://n/zs"));
+        SAME(jstr(cJSON_GetObjectItemCaseSensitive(e, "thumbnail"), "url"),
+             "https://raw.githubusercontent.com/o/r/main/dist/icons/hicolor/128x128/apps/wimsy.png");
+        free(printed);
+    }
     cJSON_Delete(e);
     e = lk_answer(&l, "!nightly", numbers, &n);
     CHECK(times_asked("GET", "https://api.github.com/repos/o/nightly/releases/latest") == 1);

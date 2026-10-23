@@ -306,6 +306,33 @@ static const cJSON* named(const cJSON* list, const char* key, const char* name) 
     cJSON_ArrayForEach(item, list) if (!strcmp(S(jstr(item, key)), name)) found = item; /* the last, as a dict keeps */
     return found;
 }
+/* package i's field's name: its system, and its architecture where it has one */
+static char* package_name(int i) {
+    return strchr(PACKAGES[i].arch, ',') ? rei_strdup(PACKAGES[i].system)
+                                         : rei_format("%s %s", PACKAGES[i].system, PACKAGES[i].arch);
+}
+/* package i published as asset: its kind linked, and its size */
+static void published(Buf* v, int i, const cJSON* asset) {
+    buf_printf(v, "[%s](%s)\n%.1f MB", PACKAGES[i].kind, S(jstr(asset, "browser_download_url")),
+               jnum(asset, "size") / 1e6);
+}
+int cd_downloads(cJSON* fields, const cJSON* release) {
+    int i, n = 0;
+    for (i = 0; i < NPACKAGES; ++i) {
+        const cJSON* asset = named(cJSON_GetObjectItemCaseSensitive(release, "assets"), "name", PACKAGES[i].file);
+        Buf v = {0};
+        char* name;
+        if (!asset) continue;
+        published(&v, i, asset);
+        name = package_name(i);
+        field(fields, name, v.text);
+        free(name);
+        buf_free(&v);
+        ++n;
+    }
+    return n;
+}
+char* cd_mascot(const char* repo) { return rei_format(WIMSY, repo); }
 /* a field per release file: published, its link and size; else what its job does; built: what a built one waits for.
    Then a field per job of CHECKS: what its tests did */
 static void packages(cJSON* fields, const cJSON* jobs, const cJSON* release, const char* built) {
@@ -317,8 +344,7 @@ static void packages(cJSON* fields, const cJSON* jobs, const cJSON* release, con
         Buf v = {0};
         char* name;
         if (asset)
-            buf_printf(&v, "[%s](%s)\n%.1f MB", PACKAGES[i].kind, S(jstr(asset, "browser_download_url")),
-                       jnum(asset, "size") / 1e6);
+            published(&v, i, asset);
         else if (!job || !strcmp(status, "queued") || !strcmp(status, "waiting") || !strcmp(status, "pending") ||
                  !strcmp(status, "requested"))
             buf_add(&v, "Waiting");
@@ -330,8 +356,7 @@ static void packages(cJSON* fields, const cJSON* jobs, const cJSON* release, con
             capitalized(&v, conclusion);
         else
             buf_printf(&v, "Failed\n[log](%s)", S(jstr(job, "html_url")));
-        name = strchr(PACKAGES[i].arch, ',') ? rei_strdup(PACKAGES[i].system)
-                                             : rei_format("%s %s", PACKAGES[i].system, PACKAGES[i].arch);
+        name = package_name(i);
         field(fields, name, v.text);
         free(name);
         buf_free(&v);
@@ -389,7 +414,7 @@ static cJSON* embed(Cards* c, const char* title, const char* url, char* descript
     cJSON_AddStringToObject(e, "url", url);
     cJSON_AddStringToObject(e, "description", description);
     cJSON_AddNumberToObject(e, "color", color);
-    picture = rei_format(WIMSY, c->gh->repo);
+    picture = cd_mascot(c->gh->repo);
     thumb = cJSON_AddObjectToObject(e, "thumbnail");
     cJSON_AddStringToObject(thumb, "url", picture);
     iso_of(rei_now(), when);
