@@ -140,28 +140,22 @@ cJSON* lk_reply(const cJSON* const* items, int n) {
     return e;
 }
 cJSON* lk_build(const cJSON* release, const char* said, const char* repo) {
-    cJSON *fields = cJSON_CreateArray(), *e;
     const char* name = jstr(release, "name");
     char *title, *mascot = cd_mascot(repo);
-    int n = cd_downloads(fields, release);
-    Buf b = {0};
+    Buf b = {0}, lines = {0};
+    cJSON* e;
     if (said && *said) buf_add(&b, said);
-    if (!n) buf_printf(&b, "%sNo downloads on it yet.", b.len ? "\n" : "");
-    if (b.len)
-        e = embed(b.text, jbool(release, "prerelease") ? GREY : REI_OPEN);
-    else { /* the fields alone: Discord takes no empty description */
-        e = cJSON_CreateObject();
-        cJSON_AddNumberToObject(e, "color", jbool(release, "prerelease") ? GREY : REI_OPEN);
-    }
+    if (cd_downloads(&lines, release))
+        buf_printf(&b, "%s%s", b.len ? "\n" : "", lines.text);
+    else
+        buf_printf(&b, "%sNo downloads on it yet.", b.len ? "\n" : "");
+    e = embed(b.text, jbool(release, "prerelease") ? GREY : REI_OPEN);
+    buf_free(&lines);
     buf_free(&b);
     title = letters(name && *name ? name : jstr(release, "tag_name") ? jstr(release, "tag_name") : "", 256);
     cJSON_AddStringToObject(e, "title", title);
     jset(e, "url", jstr(release, "html_url"));
     cJSON_AddStringToObject(cJSON_AddObjectToObject(e, "thumbnail"), "url", mascot);
-    if (n)
-        cJSON_AddItemToObject(e, "fields", fields);
-    else
-        cJSON_Delete(fields);
     free(title);
     free(mascot);
     return e;

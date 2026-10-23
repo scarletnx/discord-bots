@@ -273,6 +273,11 @@ int main(void) {
     rg_init(&cards_gh, env.repo, env.nightly, rh_fetch, &github_auth);
     lk_init(&replies, &link_gh);
     dc_init(&dc, rh_fetch, &discord_auth);
+    { /* the icon beside each download, the application's emojis: a card or a reply drawn without them says so */
+        cJSON* emojis = dc_emojis(&dc);
+        cd_icons(emojis);
+        cJSON_Delete(emojis);
+    }
     cdd.ctx = &dc;
     cdd.post = card_post;
     cdd.edit = card_edit;

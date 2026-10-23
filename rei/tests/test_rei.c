@@ -334,21 +334,30 @@ static void commands(void) {
     CHECK(n == 0);
     SAME(jstr(e, "title"), "Nightly 2026-10-17 (44aa300)");
     SAME(jstr(e, "url"), "https://n/nightly-2026-10-17-44aa300");
-    /* the cards' look: a field a package, in their order, each its kind linked and its size; a file the cards do not
-       list (the AppImage's .zsync) left out; the mascot beside them */
+    /* a line a package, in the cards' order, its icon (the application's emoji), its system and its extension linked;
+       a file the cards do not list (the AppImage's .zsync) left out, no size; the mascot beside them */
     {
-        const cJSON *fields = cJSON_GetObjectItemCaseSensitive(e, "fields"), *f0 = cJSON_GetArrayItem(fields, 0),
-                    *f1 = cJSON_GetArrayItem(fields, 1);
-        char* printed = cJSON_PrintUnformatted(e);
-        CHECK(cJSON_GetArraySize(fields) == 2 && !jstr(e, "description"));
-        SAME(jstr(f0, "name"), "Linux x86-64");
-        SAME(jstr(f0, "value"), "[AppImage](https://n/lin)\n52.4 MB");
-        SAME(jstr(f1, "name"), "Windows x86-64");
-        SAME(jstr(f1, "value"), "[zip](https://n/win)\n83.9 MB");
-        CHECK(printed && !strstr(printed, "zsync") && !strstr(printed, "https://n/zs"));
+        cJSON* emojis =
+            cJSON_Parse("[{\"name\":\"wimsy_linux\",\"id\":\"11\"},{\"name\":\"wimsy_windows\",\"id\":\"22\"}]");
+        char* printed;
+        cJSON_Delete(e);
+        cd_icons(emojis);
+        e = lk_answer(&l, "!nightly", numbers, &n);
+        printed = cJSON_PrintUnformatted(e);
+        SAME(jstr(e, "description"), "<:wimsy_linux:11> Linux x86-64: [.AppImage](https://n/lin)\n"
+                                     "<:wimsy_windows:22> Windows x86-64: [.zip](https://n/win)");
+        CHECK(printed && !strstr(printed, "zsync") && !strstr(printed, "MB") &&
+              !cJSON_GetObjectItemCaseSensitive(e, "fields"));
         SAME(jstr(cJSON_GetObjectItemCaseSensitive(e, "thumbnail"), "url"),
              "https://raw.githubusercontent.com/o/r/main/dist/icons/hicolor/128x128/apps/wimsy.png");
         free(printed);
+        cJSON_Delete(e);
+        /* an emoji the application lacks: its line without the icon */
+        cd_icons(NULL);
+        e = lk_answer(&l, "!nightly", numbers, &n);
+        HAS(jstr(e, "description"), "Linux x86-64: [.AppImage](https://n/lin)");
+        CHECK(!strstr(jstr(e, "description"), "<:"));
+        cJSON_Delete(emojis);
     }
     cJSON_Delete(e);
     e = lk_answer(&l, "!nightly", numbers, &n);
@@ -787,6 +796,14 @@ static void pr_card(void) {
        "\"html_url\":\"https://j/4\"}]}");
     answer("POST", "https://api.github.com/graphql", 200,
            "{\"data\":{\"repository\":{\"pullRequest\":{\"closingIssuesReferences\":{\"nodes\":[]}}}}}");
+    {
+        cJSON* emojis =
+            cJSON_Parse("[{\"name\":\"wimsy_linux\",\"id\":\"11\"},{\"name\":\"wimsy_windows\",\"id\":\"22\"},"
+                        "{\"name\":\"wimsy_android\",\"id\":\"33\"},{\"name\":\"wimsy_macos\",\"id\":\"44\"},"
+                        "{\"name\":\"wimsy_ios\",\"id\":\"55\"}]");
+        cd_icons(emojis);
+        cJSON_Delete(emojis);
+    }
     e = cd_pr(&c, 7, &open, &closed);
     CHECK(e && open && !closed);
     text = cJSON_PrintUnformatted(e);
@@ -796,20 +813,19 @@ static void pr_card(void) {
         "on main at [`3333333`](https://github.com/o/r/commit/3333333333333333333333333333333333333333) "
         "([its nightly](https://n/1)).");
     HAS(text, "**2 commits**, the newest first\\n- \\\\[gpu\\\\] Second \\\\*one\\\\*\\n- \\\\[gpu\\\\] First");
-    HAS(text, "{\"name\":\"Linux x86-64\",\"value\":\"Building\\n[log](https://j/1)\",\"inline\":true}");
-    HAS(text, "{\"name\":\"Linux ARM64\",\"value\":\"Built\\nbeing published\",\"inline\":true}");
-    HAS(text, "{\"name\":\"Windows x86-64\",\"value\":\"[zip](https://n/w)\\n12.3 MB\",\"inline\":true}");
-    HAS(text, "{\"name\":\"Android\",\"value\":\"Failed\\n[log](https://j/2)\",\"inline\":true}");
-    HAS(text, "{\"name\":\"macOS ARM64\",\"value\":\"Waiting\",\"inline\":true}"); /* its job queued */
-    HAS(text, "{\"name\":\"iOS ARM64\",\"value\":\"Waiting\",\"inline\":true}");
-    HAS(text, "{\"name\":\"Linux PowerPC64 LE\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Linux "
-              "PowerPC64 BE\",\"value\":\"[AppImage (Linux programs)](https://n/p)\\n2.3 MB\",\"inline\":true},"
-              "{\"name\":\"Linux RISC-V 64\"");
-    HAS(text, "{\"name\":\"Linux RISC-V 64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Linux "
-              "LoongArch64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Windows x86-64\"");
-    /* the jobs that make no file after the packages: what their tests did */
-    HAS(text, "{\"name\":\"iOS ARM64\",\"value\":\"Waiting\",\"inline\":true},{\"name\":\"Linux PowerPC64 BE "
-              "ELFv1 tests\",\"value\":\"Tests failed\\n[log](https://j/4)\",\"inline\":true},{\"name\":\"Build\"");
+    /* a line a package in one Downloads field, its icon, then its link or its job's state; the jobs that make no
+       file after it, what their tests did */
+    HAS(text,
+        "{\"name\":\"Downloads\",\"value\":\"<:wimsy_linux:11> Linux x86-64: Building ([log](https://j/1))\\n"
+        "<:wimsy_linux:11> Linux ARM64: Built, being published\\n<:wimsy_linux:11> Linux PowerPC64 LE: Waiting\\n"
+        "<:wimsy_linux:11> Linux PowerPC64 BE: [.AppImage](https://n/p) (Linux programs)\\n"
+        "<:wimsy_linux:11> Linux RISC-V 64: Waiting\\n<:wimsy_linux:11> Linux LoongArch64: Waiting\\n"
+        "<:wimsy_windows:22> Windows x86-64: [.zip](https://n/w)\\n"
+        "<:wimsy_android:33> Android: Failed ([log](https://j/2))\\n"
+        "<:wimsy_macos:44> macOS ARM64: Waiting\\n<:wimsy_ios:55> iOS ARM64: Waiting\",\"inline\":false},"
+        "{\"name\":\"Linux PowerPC64 BE ELFv1 tests\",\"value\":\"Tests failed\\n[log](https://j/4)\",\"inline\":true},"
+        "{\"name\":\"Build\"");
+    CHECK(!strstr(text, " MB"));
     HAS(text, "{\"name\":\"Build\",\"value\":\"[Running](https://r/9)\",\"inline\":true}");
     HAS(text, "{\"name\":\"Builds\",\"value\":\"[All files](https://n/pr-7)\",\"inline\":true}");
     HAS(text, "\"color\":2066493"); /* GitHub's green: open */

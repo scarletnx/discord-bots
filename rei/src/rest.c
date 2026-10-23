@@ -91,6 +91,20 @@ u64 dc_self(Dc* d) {
     answer_free(&a);
     return d->self;
 }
+cJSON* dc_emojis(Dc* d) {
+    RgAnswer a = {0};
+    u64 app = dc_self(d);
+    char* path = rei_format("applications/%llu/emojis", (unsigned long long)app);
+    cJSON *got = NULL, *items = NULL;
+    if (app && ask(d, "GET", path, NULL, &a) == 200 && (got = cJSON_Parse(a.body)))
+        items = cJSON_DetachItemFromObjectCaseSensitive(got, "items");
+    else if (app)
+        said_wrong("GET", path, &a);
+    cJSON_Delete(got);
+    answer_free(&a);
+    free(path);
+    return items;
+}
 u64 dc_post(Dc* d, u64 channel, const cJSON* embed, u64 reply_to) {
     char *path = rei_format("channels/%llu/messages", (unsigned long long)channel), *body = message_of(embed, reply_to);
     RgAnswer a = {0};
