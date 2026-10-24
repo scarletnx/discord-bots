@@ -4,12 +4,14 @@ Two bots, each a service of its own in a FreeBSD jail (Bastille), `discordbots` 
 the jail with [Concord](https://github.com/Cogmasters/concord) v3.0.1, libcurl and [cJSON](https://github.com/DaveGamble/cJSON)
 1.7.19 (`rei/third_party/cjson`); Xuji in Python 3.12 with discord.py from the jail's packages. A third, AogoWimsy,
 runs beside a Claude Code session instead: the MCP server the session starts, Python 3.12 with its standard library.
+XujiWimsy is the same server for a Grok Build session, with a bot of its own.
 
 | Bot | What it does | What it reads | What it sends out |
 |---|---|---|---|
 | `rei/` (ReiWimsy) | A message that names `#160` (`issue #160`, `PR #160` too; a bare number is talk) gets one reply: each linked, with its title, issue or PR, its state and labels, in GitHub's colours. `!nightly` links the newest nightly and its downloads, `!release` the newest version (the nightly while there is none), `!release #355` a pull request's builds. With a GitHub token it edits a reply of the last week when what it links changes. The cards: a message for each open pull request, each open issue and each push to main, in channels of their own, drawn from what GitHub says now and edited as it changes (its state, its commits or changes, the latest comment a person wrote, each package of its build); its activity (a push, a person's comment, a change of state, a pull request's builds published or failed) moves it to the end of its channel, posted again before the old one is deleted; a pull request or an issue closed keeps its card a day, as it closed, then the card is deleted | the text of messages, only to find those; GitHub's API, every 30 s, for what changed | the numbers, to GitHub's API |
 | `xuji/xuji.py` | Grok 4.7 (XG47, codename Xuji) for its owner alone: a reply to a message mentioning @Xuji answers about the message quoted; `@Xuji handback #channel FROM [TO] [notes]` writes a handback for Aogo as a Markdown file. In a channel or in its DMs | the quoted message, or a channel's messages of those days | to xAI: the texts, scrubbed (no names or ids, people as user1, user2..., mentions, e-mails and phones out, files by name only) |
 | `aogo/aogowimsy.py` (AogoWimsy) | Aogo, the Claude Code session, on Discord as a bot user of its own, through four MCP tools: post (only once its owner approves the draft), the same wait on a draft still waiting, read a channel, wait for a reply. A Claude Code channel too: while the session runs it stays on Discord's gateway and wakes the session with what is addressed to it | the messages of the channels it lists and their threads, or of every one it sees, and its owner's DMs with it: the owner's, the listed users' and its own reach the session, and a stranger's only once its owner lets it through; the others only counted, and a stranger's DM only by name; its owner's reactions to a draft or to a stranger's message | to Discord, the drafts (to its owner's DMs) and the posts approved; to the session, the messages it may read and the ones addressed to it |
+| `xuji/xujiwimsy.py` (XujiWimsy) | Xuji, the Grok Build session, on Discord as a bot user of its own: AogoWimsy's code and four tools, with Xuji's bot and settings. No channel: the session hears by waiting for a reply, and its owner's answers to its drafts and the gateway's news come with its next tool result | as AogoWimsy | as AogoWimsy, but nothing is pushed: the session gets what a tool returns |
 
 Anyone else mentioning Xuji gets nothing and costs nothing. No bot keeps a message or logs what was said, and none
 pings anyone.
@@ -81,6 +83,10 @@ what the owner let through is kept in memory while it runs; stderr says what ran
 who said it. A 429 waits its `retry_after` and tries again; any other failure comes back to the session with Discord's
 status and message, as does a value a tool refuses, named with what it takes.
 
+It serves Claude Code alone, so that no other client posts as Aogo: an `initialize` whose `clientInfo` name is not
+`claude-code` (Claude Code's) gets an error naming that name and XujiWimsy, the server logs it, and nothing reaches
+Discord. XujiWimsy (below) refuses Claude Code the same way.
+
 ### As a channel
 
 Started with the development flag (custom channels are not on the research preview's allowlist, so `--channels`
@@ -134,9 +140,74 @@ after its application (below):
 
        claude mcp add --scope project aogowimsy -- python3 /path/to/discord-bots/aogo/aogowimsy.py
 
+## XujiWimsy
+
+Xuji, the Grok Build session, on Discord as a bot user of its own. `xuji/xujiwimsy.py` runs `aogo/aogowimsy.py` with
+Xuji's identity (the table `IDENTITIES` there): its bot, its env file and keys, its name in every text. Everything
+else is AogoWimsy's, a fix to one a fix to both: the four tools above, with the same arguments, defaults and answers;
+the owner's check mark as the only way out; the owner, the listed users and the strangers he lets through; nothing
+stored, and stderr never saying what was said.
+
+It serves any client but Claude Code: an `initialize` from `claude-code` gets an error naming it and AogoWimsy. It
+offers no channel (Grok Build shows no push), so it says in its instructions how Discord reaches the session:
+
+- by waiting: `discord_wait` on a channel, after the id of the newest message the session has seen there
+  (`discord_read` gives it), and again after the `after` it returns. It brings the first message from the owner or a
+  listed user in that channel or thread; `discord_read` gives the rest, the strangers' messages the owner let through
+  among them. The owner's DMs with XujiWimsy are the channel of a draft's link.
+- with the next tool result: the gateway still posts a draft the moment its owner answers it, waited on or not, and
+  that answer (`The owner approved draft ...: posted as ...`, or refused), and the gateway's news (it stopped, cannot
+  be reached, is back), come after that result's own JSON, a text each opening `XujiWimsy news:`. It keeps the newest
+  20, and says how many older ones were left out.
+
+A message addressed to Xuji in a channel nobody waits on is not heard until the session reads that channel.
+
+Its settings, a line each of its env file, `~/.config/xujiwimsy/xujiwimsy.env` unless `--env FILE` names another (mode
+600 or stricter), with AogoWimsy's meanings and checks:
+
+| Key | Default | What it is |
+|---|---|---|
+| `XUJIWIMSY_TOKEN` | none: needed | the bot's token |
+| `XUJIWIMSY_OWNER` | none: needed | the owner's user id: who approves every post and lets a stranger's message through |
+| `XUJIWIMSY_USERS` | none: needed | `id,id`: whose messages reach the session (the owner's always do) |
+| `XUJIWIMSY_CHANNELS` | every channel and thread the bot can see | `id,id`: where it reads and posts; a thread of one of them counts as it |
+
+A key it does not know stops it, naming the key: an `AOGOWIMSY_` one too, so one bot's file never starts the other.
+Setting it up, after its application (below):
+
+1. Its owner shares a server with it and lets that server's members send them DMs, as for AogoWimsy.
+2. The env file, then a look at it (the line `up`, or what is wrong):
+
+       install -d -m 700 ~/.config/xujiwimsy
+       install -m 600 xuji/xujiwimsy.env.example ~/.config/xujiwimsy/xujiwimsy.env   # then fill it in
+       python3 xuji/xujiwimsy.py </dev/null
+
+3. Grok Build, in `~/.grok/config.toml`, then `grok mcp doctor xujiwimsy` (it initializes the server, which then
+   connects to Discord's gateway until the check ends):
+
+       [mcp_servers.xujiwimsy]
+       command = "python3"
+       args = ["/path/to/discord-bots/xuji/xujiwimsy.py"]
+       tool_timeout_sec = 3900
+
+   Grok ends a tool call at `tool_timeout_sec`, and its docs disagree on the default (its README says 60 s, the user
+   guide that came with 1.0.60 says 6000 s); a wait may take 3600 s (the most `wait` takes) and the calls to Discord
+   around it, so the block sets 3900 and no wait the server takes outlasts it. With less, a longer wait ends in Grok's timeout instead of the
+   tool's answer: a draft still waiting is then posted when the owner answers, and the next tool result says so.
+
+Grok Build also starts the MCP servers of `~/.claude.json` and of a `.mcp.json` from its folder up to the git root.
+A Grok session started where a `.mcp.json` names aogowimsy would start AogoWimsy, with Aogo's token: AogoWimsy refuses
+it, and `grok mcp doctor` shows `handshake failed (JSON-RPC error: -32602: Invalid params: clientInfo.name is
+"grok-shell-aogowimsy", not "claude-code": ...)`. To keep it from starting at all, from that folder:
+
+    grok mcp disable aogowimsy        # writes disabled_mcp_servers = ["aogowimsy"] to ~/.grok/config.toml
+
+In Grok Build 1.0.60, neither `[compat.claude] mcps = false` (it covers `~/.claude.json` alone) nor an
+`[mcp_servers.aogowimsy]` table holding only `enabled = false` keeps a `.mcp.json` server from starting.
+
 ## Tests
 
-    make -C rei test && python3 xuji/test_xuji.py && python3 aogo/test_aogowimsy.py
+    make -C rei test && python3 xuji/test_xuji.py && python3 aogo/test_aogowimsy.py && python3 xuji/test_xujiwimsy.py
 
 No network and no Discord: the parsing, the gateway's events (read from their JSON: Concord decodes none of them, as
 its decoder crashed on messages of 2 to 3 KB) and the messages waiting for an answer, the replies and their edits,
@@ -146,7 +217,9 @@ stdin and stdout), its tools against a fake Discord on 127.0.0.1 (drafts approve
 person's reaction, the channels and the people it may, `from`, Discord's 429s and errors), what the gateway's events
 push to the session (who and what wakes it, the owner's reaction and reply letting a stranger through), and its gateway
 client against a fake gateway on 127.0.0.1 (identify, heartbeats and their ACKs, resume, the close codes that stop it,
-pings, messages in frames), and that lines from several threads never mix on stdout.
+pings, messages in frames), and that lines from several threads never mix on stdout; XujiWimsy's env file and keys
+(the other bot's refused), its server, instructions and tools in its own names, the client each Wimsy serves, the news
+a tool result carries, a post as it reaches Discord, and the program itself on stdin and stdout.
 
 ## Deploy (on the jail's host, as root)
 
