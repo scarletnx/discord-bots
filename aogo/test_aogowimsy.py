@@ -806,6 +806,182 @@ class Read(WithDiscord):
         self.assertEqual([m['text'] for m in self.tool('discord_read', channel=OTHER)['messages']], ['anywhere'])
 
 
+class Attachments(WithDiscord):
+    def setUp(self):
+        super().setUp()
+        folder = tempfile.TemporaryDirectory(prefix='aogowimsy-files-')
+        self.addCleanup(folder.cleanup)
+        self.bot.files = Path(folder.name) / 'cache' / 'aogowimsy'
+
+    def carrying(self, channel, author, files, content='', **extra):
+        """a message with files [(name, bytes, type)], each served by the fake CDN; its id"""
+        number = self.fake.say(channel, author, content, **extra)
+        kept = []
+        for place, (name, data, kind) in enumerate(files):
+            path = f'/attachments/{channel}/{number}{place}/{urllib.parse.quote(name)}'
+            self.fake.blobs[path] = (data, kind)
+            item = {'id': f'{number}{place}', 'filename': name, 'size': len(data), 'url': self.fake.origin + path}
+            kept.append(dict(item, content_type=kind))
+        self.fake.find(channel, number)['attachments'] = kept
+        return number
+
+    def cdn(self):
+        return [r for r in self.fake.requests if r[0] == 'CDN']
+
+    def test_the_owners_files_land_in_the_messages_folder_private_and_fetched_without_the_token(self):
+        log = b'line 1\nline 2\n'
+        number = self.carrying(GENERAL, OWNER, [('shot.png', PNG, 'image/png'), ('game.log', log, 'text/plain')])
+        self.fake.find(GENERAL, number)['attachments'][0].update(width=1920, height=1080)
+        got = self.tool('discord_attachments', channel=GENERAL, message=number)
+        folder = self.bot.files / GENERAL / number
+        self.assertEqual((got['channel'], got['message'], got['folder']), (GENERAL, number, str(folder)))
+        self.assertEqual(
+            got['files'],
+            [
+                {
+                    'name': 'shot.png',
+                    'type': 'image/png',
+                    'size': len(PNG),
+                    'width': 1920,
+                    'height': 1080,
+                    'path': str(folder / 'shot.png'),
+                },
+                {'name': 'game.log', 'type': 'text/plain', 'size': len(log), 'path': str(folder / 'game.log')},
+            ],
+        )
+        self.assertEqual(((folder / 'shot.png').read_bytes(), (folder / 'game.log').read_bytes()), (PNG, log))
+        for level in (self.bot.files, self.bot.files / GENERAL, folder):
+            self.assertEqual(level.stat().st_mode & 0o777, 0o700, level)
+        self.assertEqual((folder / 'shot.png').stat().st_mode & 0o777, 0o600)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ['game.log', 'shot.png'])  # no .part left
+        self.assertEqual([r[3] for r in self.cdn()], [None, None])
+
+    def test_a_file_saved_before_is_not_fetched_again(self):
+        number = self.carrying(GENERAL, FRIEND, [('a.png', PNG, 'image/png')])
+        first = self.tool('discord_attachments', channel=GENERAL, message=number)
+        again = self.tool('discord_attachments', channel=GENERAL, message=number)
+        self.assertEqual(first, again)
+        self.assertEqual(len(self.cdn()), 1)
+
+    def test_a_strangers_message_the_owner_did_not_let_through_is_refused_naming_no_one(self):
+        number = self.carrying(GENERAL, STRANGER, [('a.png', PNG, 'image/png')], 'look', mentions=[BOT])
+        self.fake.react(number, WIMSY, OTHER_PERSON)
+        said = self.error('discord_attachments', channel=GENERAL, message=number)
+        self.assertEqual(
+            said,
+            f"message {number} is not one AogoWimsy gives: neither the owner's ({OWNER}), a listed user's ({FRIEND}) "
+            f'nor its own, and the owner has not let it through (his :{aw.WIMSY}: reaction, or his reply to it '
+            'mentioning AogoWimsy)',
+        )
+        self.assertNotIn('tranger', said)
+        self.assertEqual(self.cdn(), [])
+        self.assertFalse(self.bot.files.exists())
+
+    def test_a_strangers_message_the_owner_replied_to_mentioning_aogo_or_let_through_is_saved(self):
+        quoted = self.carrying(GENERAL, STRANGER, [('q.jpg', b'\xff\xd8\xff jpeg', 'image/jpeg')])
+        self.fake.say(GENERAL, FRIEND, 'in between')
+        self.fake.say(GENERAL, OWNER, '<@1000000000000000001> any idea?', reply_to=quoted, mentions=[BOT])
+        mine = self.fake.say(GENERAL, BOT, 'a post of mine')
+        let = self.carrying(GENERAL, STRANGER, [('l.png', PNG, 'image/png')], 'for you', reply_to=mine)
+        self.fake.react(let, WIMSY, OWNER)
+        for number in (quoted, let):
+            with self.subTest(message=number):
+                got = self.tool('discord_attachments', channel=GENERAL, message=number)
+                self.assertEqual([('path' in f, 'error' in f) for f in got['files']], [(True, False)])
+        self.bot.approved.add(heard := self.carrying(GENERAL, STRANGER, [('h.png', PNG, 'image/png')]))
+        self.assertIn('path', self.tool('discord_attachments', channel=GENERAL, message=heard)['files'][0])
+
+    def test_one_too_big_or_failing_says_why_and_the_others_are_saved(self):
+        self.addCleanup(setattr, aw, 'MOST_SAVE', aw.MOST_SAVE)
+        aw.MOST_SAVE = 20
+        number = self.carrying(
+            GENERAL,
+            OWNER,
+            [
+                ('big.png', b'x' * 21, 'image/png'),
+                ('gone.png', b'gone', 'image/png'),
+                ('ok.txt', b'fits', 'text/plain'),
+            ],
+        )
+        attached = self.fake.find(GENERAL, number)['attachments']
+        del self.fake.blobs[urllib.parse.urlsplit(attached[1]['url']).path]
+        got = self.tool('discord_attachments', channel=GENERAL, message=number)
+        big, gone, ok = got['files']
+        self.assertEqual(big['error'], '21 bytes, more than the 20 AogoWimsy saves of one attachment')
+        self.assertTrue(gone['error'].startswith(f"Discord's CDN answered 401 to {attached[1]['url']}"), gone)
+        self.assertNotIn('path', big)
+        self.assertEqual(Path(ok['path']).read_bytes(), b'fits')
+        self.assertEqual([r[1].rsplit('/', 1)[1] for r in self.cdn()], ['ok.txt'])  # the big one is never fetched
+
+    def test_a_size_discord_did_not_give_is_capped_while_reading(self):
+        self.addCleanup(setattr, aw, 'MOST_SAVE', aw.MOST_SAVE)
+        aw.MOST_SAVE = 4
+        number = self.carrying(GENERAL, OWNER, [('a.png', PNG, 'image/png')])
+        del self.fake.find(GENERAL, number)['attachments'][0]['size']
+        got = self.tool('discord_attachments', channel=GENERAL, message=number)
+        self.assertIn("Discord's CDN gave more than 4 bytes for", got['files'][0]['error'])
+        self.assertEqual(list((self.bot.files / GENERAL / number).iterdir()), [])
+
+    def test_names_stay_in_the_folder_and_a_name_twice_takes_its_id(self):
+        number = self.carrying(
+            GENERAL,
+            OWNER,
+            [
+                ('../../up.txt', b'1', 'text/plain'),
+                ('a.png', PNG, 'image/png'),
+                ('a.png', b'2', 'image/png'),
+                ('...', b'3', 'text/plain'),
+                ('tab\there\n.log', b'4', 'text/plain'),
+            ],
+        )
+        ids = [a['id'] for a in self.fake.find(GENERAL, number)['attachments']]
+        got = self.tool('discord_attachments', channel=GENERAL, message=number)
+        folder = self.bot.files / GENERAL / number
+        names = [Path(f['path']).name for f in got['files']]
+        self.assertEqual(names, ['_.._up.txt', 'a.png', f'{ids[2]}-a.png', ids[3], 'tab_here_.log'])
+        self.assertTrue(all(Path(f['path']).parent == folder for f in got['files']))
+        self.assertEqual((folder / f'{ids[2]}-a.png').read_bytes(), b'2')
+
+    def test_what_is_refused_before_any_file_is_fetched(self):
+        plain = self.fake.say(GENERAL, OWNER, 'no files')
+        cases = (
+            ({'channel': GENERAL, 'message': plain}, f'message {plain} in channel {GENERAL} has no attachments'),
+            ({'channel': GENERAL, 'message': '1999999999999999999'}, 'Discord answered 404 to GET'),
+            ({'channel': OTHER, 'message': plain}, f'channel {OTHER} is not one AogoWimsy may read'),
+            ({'channel': GENERAL}, 'discord_attachments needs message'),
+            ({'channel': GENERAL, 'message': 'abc'}, 'message is "abc", not a Discord id'),
+            ({'channel': GENERAL, 'message': plain, 'into': '/tmp'}, 'discord_attachments has no argument "into"'),
+        )
+        for args, said in cases:
+            with self.subTest(args=args):
+                self.assertIn(said, self.error('discord_attachments', **args))
+        self.assertEqual(self.cdn(), [])
+
+    def test_a_write_that_fails_says_where_and_leaves_no_part(self):
+        number = self.carrying(GENERAL, OWNER, [('a.png', PNG, 'image/png')])
+        folder = self.bot.files / GENERAL / number
+        folder.mkdir(parents=True)
+        (folder / 'a.png').mkdir()  # a folder where the file goes: os.replace fails
+        got = self.tool('discord_attachments', channel=GENERAL, message=number)
+        self.assertTrue(got['files'][0]['error'].startswith(f'{folder / "a.png"} could not be written: '))
+        self.assertEqual([p.name for p in folder.iterdir()], ['a.png'])
+
+
+class SavesFolder(unittest.TestCase):
+    def test_xdg_cache_home_when_absolute_else_the_home_cache(self):
+        home = Path.home() / '.cache' / 'aogowimsy'
+        self.assertEqual(aw.saves_folder({'XDG_CACHE_HOME': '/var/tmp/c'}), Path('/var/tmp/c/aogowimsy'))
+        self.assertEqual(aw.saves_folder({'XDG_CACHE_HOME': 'relative/c'}), home)
+        self.assertEqual(aw.saves_folder({'XDG_CACHE_HOME': ''}), home)
+        self.assertEqual(aw.saves_folder({}), home)
+
+    def test_a_long_name_keeps_its_suffix_within_200_bytes(self):
+        name = aw.file_name('é' * 300 + '.png', 'fallback')
+        self.assertTrue(name.endswith('.png'))
+        self.assertLessEqual(len(name.encode()), 200)
+        self.assertEqual(aw.file_name('', '123'), '123')
+
+
 class Wait(WithDiscord):
     def test_the_first_message_from_the_owner_or_a_listed_user_passing_over_the_others(self):
         start = self.fake.say(GENERAL, OWNER, 'go')
