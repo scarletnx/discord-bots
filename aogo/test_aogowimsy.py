@@ -32,6 +32,7 @@ TOKEN = 'MTAwMDAw.fake-token_for.tests'
 PNG = b'\x89PNG\r\n\x1a\n a fake image'
 BOT, OWNER, FRIEND, STRANGER, OTHER_PERSON = (f'10000000000000000{n:02d}' for n in (1, 2, 3, 4, 5))
 GUILD = '200000000000000001'
+BOT_ROLE, OTHER_BOT_ROLE, HELPERS_ROLE = (f'70000000000000000{n:02d}' for n in (1, 2, 3))
 GENERAL, HELP, OTHER, THREAD, OTHER_THREAD, NEW_THREAD = (f'3000000000000000{n:02d}' for n in (1, 2, 3, 11, 12, 13))
 DM, FRIEND_DM, STRANGER_DM = '400000000000000001', '400000000000000002', '400000000000000003'
 WIMSY = f'{aw.WIMSY}:600000000000000001'  # the owner's custom emoji, as a reaction's path names it
@@ -45,6 +46,8 @@ class FakeDiscord:
 
     ROUTES = (
         ('GET', r'/users/@me', 'me'),
+        ('GET', r'/users/@me/guilds', 'guilds'),
+        ('GET', r'/guilds/(\d+)/roles', 'guild_roles'),
         ('POST', r'/users/@me/channels', 'open_dm'),
         ('GET', r'/gateway/bot', 'gateway'),
         ('GET', r'/channels/(\d+)', 'channel'),
@@ -76,6 +79,13 @@ class FakeDiscord:
             FRIEND_DM: {'id': FRIEND_DM, 'type': 1, 'recipients': [self.users[FRIEND]]},
             STRANGER_DM: {'id': STRANGER_DM, 'type': 1, 'recipients': [self.users[STRANGER]]},
         }
+        # the guild's roles: the one Discord made for AogoWimsy and another bot's, tagged with their bot, and a plain one
+        self.server_roles = [
+            {'id': GUILD, 'name': '@everyone', 'managed': False},
+            {'id': BOT_ROLE, 'name': 'Aogo', 'managed': True, 'tags': {'bot_id': BOT}},
+            {'id': OTHER_BOT_ROLE, 'name': 'ReiWimsy', 'managed': True, 'tags': {'bot_id': OTHER_PERSON}},
+            {'id': HELPERS_ROLE, 'name': 'helpers', 'managed': False},
+        ]
         self.messages = {channel: [] for channel in self.channels}  # oldest first
         self.reactions = {}  # a message id: {emoji: [user ids]}
         self.requests = []  # (method, path, query, body)
@@ -167,6 +177,14 @@ class FakeDiscord:
 
     def me(self, query, body):
         return 200, self.users[BOT], {}
+
+    def guilds(self, query, body):
+        return 200, [{'id': GUILD, 'name': 'ScarletNX'}], {}
+
+    def guild_roles(self, query, body, guild):
+        if guild != GUILD:
+            return 404, {'message': 'Unknown Guild', 'code': 10004}, {}
+        return 200, self.server_roles, {}
 
     def open_dm(self, query, body):
         if body != {'recipient_id': OWNER}:
@@ -762,6 +780,13 @@ class Read(WithDiscord):
         alone = self.tool('discord_read', channel=GENERAL, after=start, limit=1)  # no reply in the page, none heard
         self.assertEqual((alone['messages'], alone['left_out']), ([], 1))
 
+    def test_a_message_the_owner_replied_to_mentioning_aogos_role_is_read_too(self):
+        start = self.fake.say(GENERAL, FRIEND, 'before')
+        theirs = self.fake.say(GENERAL, STRANGER, 'a question for the room')
+        reply = self.fake.say(GENERAL, OWNER, f'<@&{BOT_ROLE}> also this', reply_to=theirs, mention_roles=[BOT_ROLE])
+        got = self.tool('discord_read', channel=GENERAL, after=start)
+        self.assertEqual([(m['id'], m['approved']) for m in got['messages']], [(theirs, True), (reply, False)])
+
     def test_a_thread_of_a_listed_channel_and_the_owners_dm_read_without_being_listed(self):
         ids = self.conversation(THREAD)
         got = self.tool('discord_read', channel=THREAD)
@@ -1053,6 +1078,35 @@ class Channels(WithDiscord):
         number = self.heard(HELP, FRIEND, '<@1000000000000000001> look', mentions=[BOT])
         meta = {'kind': 'message', 'author': 'friend', 'author_id': FRIEND, 'channel': HELP, 'message_id': number}
         self.assertEqual(self.pushes, [('<@1000000000000000001> look', meta)])
+
+    def test_a_mention_of_aogos_role_is_a_mention_of_aogo(self):
+        number = self.heard(HELP, FRIEND, f'<@&{BOT_ROLE}> look', mention_roles=[BOT_ROLE])
+        meta = {'kind': 'message', 'author': 'friend', 'author_id': FRIEND, 'channel': HELP, 'message_id': number}
+        self.assertEqual(self.pushes, [(f'<@&{BOT_ROLE}> look', meta)])
+        self.heard(HELP, FRIEND, 'another bot, a plain role', mention_roles=[OTHER_BOT_ROLE, HELPERS_ROLE, GUILD])
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_the_owners_reply_mentioning_aogos_role_carries_the_message_he_replied_to(self):
+        theirs = self.fake.say(GENERAL, STRANGER, 'the percent is the current game only')
+        asked = f'<@&{BOT_ROLE}> also fix this'
+        number = self.heard(GENERAL, OWNER, asked, reply_to=theirs, mention_roles=[BOT_ROLE])
+        quote = f'\n\nReplying to Stranger ({STRANGER}), message {theirs}:\nthe percent is the current game only'
+        meta = {'kind': 'message', 'author': 'DraVee', 'author_id': OWNER, 'channel': GENERAL, 'message_id': number}
+        meta.update(reply_to=theirs, quoted_author='Stranger', quoted_author_id=STRANGER)
+        self.assertEqual(self.pushes, [(asked + quote, meta)])
+        self.assertEqual(self.bot.approved, {theirs})
+
+    def test_aogos_roles_are_asked_once_and_again_after_a_server_is_joined(self):
+        for _ in range(2):
+            self.heard(GENERAL, OWNER, f'<@&{BOT_ROLE}> ping', mention_roles=[BOT_ROLE])
+        self.assertEqual(len(self.fake.posts('GET', f'/guilds/{GUILD}/roles')), 1)
+        self.fake.server_roles[1] = dict(self.fake.server_roles[1], id=HELPERS_ROLE)  # invited again: a new role
+        self.fake.server_roles.pop()
+        self.ear.hear('GUILD_CREATE', {'id': GUILD, 'channels': [], 'threads': []})
+        self.heard(GENERAL, OWNER, f'<@&{BOT_ROLE}> the old role', mention_roles=[BOT_ROLE])
+        self.heard(GENERAL, OWNER, f'<@&{HELPERS_ROLE}> the new one', mention_roles=[HELPERS_ROLE])
+        self.assertEqual([text for text, _ in self.pushes][2:], [f'<@&{HELPERS_ROLE}> the new one'])
+        self.assertEqual(len(self.fake.posts('GET', f'/guilds/{GUILD}/roles')), 2)
 
     def test_a_message_not_addressed_to_aogo_is_not_pushed(self):
         theirs = self.fake.say(GENERAL, FRIEND, 'a post of a friend')

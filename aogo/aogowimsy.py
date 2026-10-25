@@ -432,22 +432,31 @@ def view(message, approved=False):
     }
 
 
-def mentions_me(message, me):
-    return any(user.get('id') == me for user in message.get('mentions') or [])
+def mentions_me(message, me, roles):
+    """whether a message mentions AogoWimsy's user or its role: the one Discord makes for a bot, of its name, which
+    @Aogo may pick as well (DraVee's of 2026-10-24 did)"""
+    if any(user.get('id') == me for user in message.get('mentions') or []):
+        return True
+    return any(role in roles for role in message.get('mention_roles') or [])
 
 
-def addressed(message, me):
+def bot_roles(roles, me):
+    """the ids of a server's roles Discord made for AogoWimsy"""
+    return {role['id'] for role in roles if (role.get('tags') or {}).get('bot_id') == me}
+
+
+def addressed(message, me, roles):
     """whether a message mentions AogoWimsy or replies to one of its messages"""
-    if mentions_me(message, me):
+    if mentions_me(message, me, roles):
         return True
     answered = message.get('referenced_message') or {}
     return message.get('type') == REPLY and (answered.get('author') or {}).get('id') == me
 
 
-def quoting(message, owner, me):
+def quoting(message, owner, me, roles):
     """the id of the message the owner replied to while mentioning AogoWimsy, which lets it through as his WIMSY
     does (DraVee, 2026-10-21: "e literalmente eu quotando outra pessoa"); None for any other message"""
-    if message['author']['id'] != owner or message.get('type') != REPLY or not mentions_me(message, me):
+    if message['author']['id'] != owner or message.get('type') != REPLY or not mentions_me(message, me, roles):
         return None
     return (message.get('message_reference') or {}).get('message_id')
 
@@ -578,7 +587,7 @@ class AogoWimsy:
     def __init__(self, settings, discord, clock, hub=None):
         self.settings, self.discord, self.clock = settings, discord, clock
         self.hub = hub or Hub()
-        self.known = {}  # its own user id and the owner's DM channel, asked once
+        self.known = {}  # its own user id, its roles and the owner's DM channel, asked once
         self.approved = set()  # the messages the owner let through while the gateway heard: their ids, in memory only
         self.guard = threading.Lock()
         self.drafts = {}  # a lock a draft: one look at a time, so no draft is posted twice
@@ -589,6 +598,16 @@ class AogoWimsy:
         if 'me' not in self.known:
             self.known['me'] = self.discord('GET', '/users/@me')['id']
         return self.known['me']
+
+    def roles(self):
+        """the roles Discord made for AogoWimsy, one a server: asked once, and again after the gateway says it joined
+        a server"""
+        if 'roles' not in self.known:
+            me, found = self.me(), set()
+            for guild in self.discord('GET', '/users/@me/guilds'):
+                found |= bot_roles(self.discord('GET', f'/guilds/{guild["id"]}/roles'), me)
+            self.known['roles'] = found
+        return self.known['roles']
 
     def dm(self):
         if 'dm' not in self.known:
@@ -759,7 +778,7 @@ class AogoWimsy:
 
     def let_through(self, channel, message, me):
         """whether a stranger's message is addressed to AogoWimsy and carries the owner's WIMSY reaction"""
-        if not addressed(message, me):
+        if not addressed(message, me, self.roles()):
             return False
         for reaction in message.get('reactions') or []:
             emoji = reaction.get('emoji') or {}
@@ -815,7 +834,8 @@ class AogoWimsy:
         page = sorted(self.discord('GET', f'/channels/{channel}/messages', **query), key=lambda m: int(m['id']))
         me = self.me()
         heard = named if named is not None else self.people() | {me}
-        quoted = self.approved | {quoting(m, self.settings.owner, me) for m in page}
+        roles = self.roles()
+        quoted = self.approved | {quoting(m, self.settings.owner, me, roles) for m in page}
         kept = []
         for message in page:
             author = message['author']['id']
@@ -1216,6 +1236,7 @@ class Ear:
             self.tools.known['me'] = data['user']['id']
             self.hub.gap()
         elif kind == 'GUILD_CREATE':
+            self.tools.known.pop('roles', None)  # a server joined, or seen again: its role may be new
             for channel in (data.get('channels') or []) + (data.get('threads') or []):
                 self.kinds[channel['id']] = (channel.get('type'), channel.get('parent_id'))
         elif kind in ('CHANNEL_CREATE', 'CHANNEL_UPDATE', 'THREAD_CREATE', 'THREAD_UPDATE'):
@@ -1252,8 +1273,11 @@ class Ear:
                 log('channel: pushed a dm event')
             return
         channel = message['channel_id']
-        if author in people and addressed(message, me) and self.in_scope(channel):
-            quoted, number = None, quoting(message, self.tools.settings.owner, me)
+        if author not in people:
+            return
+        roles = self.tools.roles()
+        if addressed(message, me, roles) and self.in_scope(channel):
+            quoted, number = None, quoting(message, self.tools.settings.owner, me, roles)
             if number:
                 self.tools.approved.add(number)
                 if 'referenced_message' in message:
@@ -1277,7 +1301,9 @@ class Ear:
             return
         message = self.tools.discord('GET', f'/channels/{channel}/messages/{number}')
         me, author = self.tools.me(), message['author']['id']
-        if author == me or author in self.tools.people() or not addressed(message, me) or not self.in_scope(channel):
+        if author == me or author in self.tools.people() or not addressed(message, me, self.tools.roles()):
+            return
+        if not self.in_scope(channel):
             return
         self.tools.approved.add(number)
         self.tell(dict(message, channel_id=channel), 'approved')
