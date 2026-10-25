@@ -12,6 +12,7 @@ the initialize handshake (protocol 2025-11-25 back to 2024-11-05): Claude Code r
     discord_post_status  the same wait, on a draft that came back still waiting
     discord_read         a channel's messages: the owner's, the listed users' and AogoWimsy's own; others only counted
     discord_wait         the first message after an id from the owner or a listed user, as the gateway hears it
+    discord_attachments  a message's attachments saved to a folder of its own, for a message discord_read gives
 
 It is also a Claude Code channel (experimental capability claude/channel): once the session is up it stays on
 Discord's gateway, and pushes into the session, as notifications/claude/channel, each message addressed to AogoWimsy
@@ -22,8 +23,9 @@ The owner's reply that mentions AogoWimsy lets the message he replied to through
 Discord's REST API v10 (urllib) reads and posts; its gateway (a WebSocket of its own, ssl and socket) hears. It works
 in the channels AOGOWIMSY_CHANNELS lists and their threads, or in every one Discord lets it see when it lists none,
 and in the owner's DMs with it. The owner's check mark is the only way a text gets out: no setting turns it off.
-Nothing is stored: a draft waiting is a message in the owner's DMs, read again at each look, and stderr says what
-ran or failed, never what was said nor who said it.
+Nothing is stored but the attachments discord_attachments is asked for, in <XDG_CACHE_HOME or ~/.cache>/aogowimsy/
+<channel>/<message>/ (folders 700, files 600): a draft waiting is a message in the owner's DMs, read again at each look,
+and stderr says what ran or failed, never what was said nor who said it.
 """
 
 import argparse
@@ -49,7 +51,7 @@ import uuid
 from pathlib import Path
 from typing import NamedTuple
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 SERVER_INFO = {'name': 'aogowimsy', 'title': 'AogoWimsy', 'version': VERSION}
 API = 'https://discord.com/api/v10'
 AGENT = f'DiscordBot (https://github.com/scarletnx/discord-bots, {VERSION})'
@@ -59,7 +61,8 @@ KEYS = (*NEEDED, 'AOGOWIMSY_CHANNELS')
 LIMIT = 2000  # a Discord message's letters
 IMAGES = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.gif': 'image/gif', '.webp': 'image/webp'}
 MOST_FILES = 4  # images a post carries; how big each may be is Discord's to say, in the owner's DMs first
-CDN = ('https://cdn.discordapp.com/', 'https://media.discordapp.net/')  # where a draft's images are fetched from
+CDN = ('https://cdn.discordapp.com/', 'https://media.discordapp.net/')  # where attachments are fetched from
+MOST_SAVE = 64 << 20  # bytes of one attachment discord_attachments saves at most
 POLL = 3.0  # seconds between two looks at a draft's reactions
 LOOK = 1.0  # seconds a wait sleeps at most before looking again at what the gateway brought
 MOST_WAIT = 3600  # seconds a tool waits at most
@@ -244,7 +247,9 @@ def instructions(settings):
         'channel, message_id and reply_to; kind="dm" (someone else wrote to AogoWimsy in DMs: their name only), '
         'kind="draft" (the owner answered a draft in his DMs, and it was posted or refused at once: draft, status, '
         'channel, and message_id once posted), kind="error" or "notice" (the gateway). Answer in Discord with '
-        f"discord_post, reply_to the message_id: it still waits for the owner's {YES}."
+        f"discord_post, reply_to the message_id: it still waits for the owner's {YES}. A message's attachments (an "
+        "event's attachments, or quoted_attachments of the message in reply_to) are yours to open with "
+        'discord_attachments, which saves them and gives their paths.'
     )
 
 
@@ -345,15 +350,20 @@ class Discord:
             except ValueError:
                 raise DiscordError(f'Discord answered {method} {path} with something that is not JSON') from None
 
-    def download(self, url):
-        """an attachment's bytes from Discord's CDN (or, in the tests, from where the API is), without the token"""
+    def download(self, url, most=None):
+        """an attachment's bytes from Discord's CDN (or, in the tests, from where the API is), without the token;
+        a DiscordError for one longer than most bytes"""
         api = urllib.parse.urlsplit(self.api)
         if not url.startswith(CDN) and not url.startswith(f'{api.scheme}://{api.netloc}/attachments/'):
             raise DiscordError(f'an attachment at {url}: AogoWimsy fetches them from {" or ".join(CDN)} alone')
         try:
             with urllib.request.urlopen(urllib.request.Request(url, headers={'User-Agent': AGENT}), timeout=60) as got:
-                return got.read()
+                data = got.read() if most is None else got.read(most + 1)
+                if most is not None and len(data) > most:
+                    raise DiscordError(f"Discord's CDN gave more than {most} bytes for {url}")
+                return data
         except urllib.error.HTTPError as error:
+            error.close()
             raise DiscordError(f"Discord's CDN answered {error.code} to {url}", error.code) from None
         except OSError as error:
             raise DiscordError(
@@ -410,6 +420,26 @@ def images(value):
             raise Refused(f'files item {place}, {item}, is empty')
         found.append((path.name, data, kind))
     return found
+
+
+def saves_folder(environ=None):
+    """where discord_attachments saves: XDG_CACHE_HOME when it is an absolute path (the XDG spec ignores any other),
+    else ~/.cache; then the server's name"""
+    base = (os.environ if environ is None else environ).get('XDG_CACHE_HOME') or ''
+    root = Path(base) if os.path.isabs(base) else Path.home() / '.cache'
+    return root / SERVER_INFO['name']
+
+
+def file_name(name, fallback):
+    """an attachment's name as a file of its message's folder: no slash, control letter or leading dot, at most 200
+    bytes with its suffix kept; fallback when nothing is left"""
+    name = re.sub(r'[\x00-\x1f\x7f/\\]', '_', name or '').lstrip('.')
+    stem, suffix = os.path.splitext(name)
+    if len(suffix.encode()) > 20:
+        stem, suffix = name, ''
+    while len((stem + suffix).encode()) > 200:
+        stem = stem[:-1]
+    return stem + suffix if stem else fallback
 
 
 def link(guild, channel, message):
@@ -584,9 +614,10 @@ class Hub:
 class AogoWimsy:
     """the tools: Discord with the settings' channels, people and owner"""
 
-    def __init__(self, settings, discord, clock, hub=None):
+    def __init__(self, settings, discord, clock, hub=None, files=None):
         self.settings, self.discord, self.clock = settings, discord, clock
         self.hub = hub or Hub()
+        self.files = Path(files) if files else saves_folder()  # where discord_attachments saves
         self.known = {}  # its own user id, its roles and the owner's DM channel, asked once
         self.approved = set()  # the messages the owner let through while the gateway heard: their ids, in memory only
         self.guard = threading.Lock()
@@ -658,6 +689,7 @@ class AogoWimsy:
             'discord_post_status': self.post_status,
             'discord_read': self.read,
             'discord_wait': self.wait_for,
+            'discord_attachments': self.attachments,
         }
         return tools[name](args, cancelled, progress)
 
@@ -858,6 +890,74 @@ class AogoWimsy:
             if len(page) < PAGE:
                 return found
             after = page[-1]['id']
+
+    def readable(self, channel, message):
+        """Refused unless discord_read gives the message: the owner's, a listed user's, AogoWimsy's own, or one the owner
+        let through (his WIMSY reaction, or his reply mentioning AogoWimsy among the PAGE messages after it); the
+        refusal names no one"""
+        me = self.me()
+        if message['author']['id'] in self.people() | {me}:
+            return
+        if message['id'] in self.approved or self.let_through(channel, message, me):
+            return
+        later = self.discord('GET', f'/channels/{channel}/messages', after=message['id'], limit=PAGE)
+        roles = self.roles()
+        if message['id'] in {quoting(m, self.settings.owner, me, roles) for m in later}:
+            return
+        raise Refused(
+            f"message {message['id']} is not one AogoWimsy gives: neither the owner's ({self.settings.owner}), a listed "
+            f"user's ({by_id(self.settings.users)}) nor its own, and the owner has not let it through (his :{WIMSY}: "
+            'reaction, or his reply to it mentioning AogoWimsy)'
+        )
+
+    def attachments(self, args, cancelled, progress):
+        take(args, 'discord_attachments', ('channel', 'message'), ())
+        channel = snowflake(args['channel'], 'channel')
+        number = snowflake(args['message'], 'message')
+        self.where(channel, reading=True)
+        message = self.discord('GET', f'/channels/{channel}/messages/{number}')  # Discord's 404 names it
+        self.readable(channel, message)
+        found = message.get('attachments') or []
+        if not found:
+            raise Refused(f'message {number} in channel {channel} has no attachments')
+        folder = self.files / channel / number
+        self.files.parent.mkdir(parents=True, exist_ok=True)
+        for level in (self.files, self.files / channel, folder):  # 700 each: other people's files
+            level.mkdir(mode=0o700, exist_ok=True)
+        saved, used = [], set()
+        for item in found:
+            if cancelled.is_set():
+                raise Cancelled
+            name = file_name(item.get('filename'), item['id'])
+            if name in used:
+                name = f'{item["id"]}-{name}'
+            used.add(name)
+            size = item.get('size')
+            entry = {'name': item.get('filename'), 'type': item.get('content_type'), 'size': size}
+            entry.update({key: item[key] for key in ('width', 'height') if item.get(key)})
+            path = folder / name
+            if isinstance(size, int) and size > MOST_SAVE:
+                entry['error'] = f'{size} bytes, more than the {MOST_SAVE} AogoWimsy saves of one attachment'
+            elif isinstance(size, int) and path.is_file() and path.stat().st_size == size:
+                entry['path'] = str(path)  # saved by an earlier call: an attachment never changes
+            else:
+                try:
+                    data = self.discord.download(item['url'], most=MOST_SAVE)
+                except DiscordError as error:
+                    entry['error'] = str(error)
+                else:
+                    part = folder / f'.{name}.part'
+                    try:
+                        with open(os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'wb') as out:
+                            out.write(data)
+                        os.replace(part, path)
+                    except OSError as error:
+                        part.unlink(missing_ok=True)
+                        entry['error'] = f'{path} could not be written: {error.strerror or error}'
+                    else:
+                        entry['path'], entry['size'] = str(path), len(data)
+            saved.append(entry)
+        return {'channel': channel, 'message': number, 'folder': str(folder), 'files': saved}
 
     def wait_for(self, args, cancelled, progress):
         take(args, 'discord_wait', ('channel', 'after'), ('wait', 'from'))
@@ -1358,7 +1458,8 @@ FROM = {
 }
 MESSAGE = (
     '{"id", "author" (their name), "author_id", "time" (ISO 8601), "text", "reply_to" (the id it answers, or null), '
-    '"attachments" (file names), "approved" (true for a stranger\'s message the owner let through)}'
+    '"attachments" (file names: discord_attachments saves them), "approved" (true for a stranger\'s message the owner '
+    'let through)}'
 )
 WHERE = (
     'Channels: those AOGOWIMSY_CHANNELS lists and their threads, or every one Discord lets the bot see when it lists '
@@ -1467,6 +1568,26 @@ TOOLS = [
                 'from': FROM,
             },
             'required': ['channel', 'after'],
+            'additionalProperties': False,
+        },
+    },
+    {
+        'name': 'discord_attachments',
+        'description': (
+            "Save a message's attachments, each a file of the message's own folder, to open with the Read tool (an "
+            "image, a log): a message discord_read gives (the owner's, a listed user's, AogoWimsy's own, or a "
+            "stranger's the owner let through), fetched from Discord's CDN without the token. Returns JSON "
+            '{"channel", "message", "folder", "files": [{"name" (as Discord has it), "type", "size", "width" and '
+            '"height" (images), and "path" when saved or "error" saying why not}]}. One over '
+            f'{MOST_SAVE >> 20} MiB is not saved, and says so. A file saved before is not fetched again. ' + WHERE
+        ),
+        'inputSchema': {
+            'type': 'object',
+            'properties': {
+                'channel': dict(ID, description='the channel, thread or DM id the message is in'),
+                'message': dict(ID, description='the message id'),
+            },
+            'required': ['channel', 'message'],
             'additionalProperties': False,
         },
     },
