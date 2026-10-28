@@ -24,21 +24,29 @@ port. A pass, `accordwimsy sync [ENV FILE]`, for each repository of the organiza
 - the repository on the Forgejo, made in its organization when it is not there, with GitHub's name, description and
   visibility, its default branch, and its Releases tab off (releases stay on GitHub);
 - its branches and tags, through a bare mirror in `mirrors/`: fetched from GitHub and pushed to the Forgejo, each side
-  pruned of what the other has not; `refs/pull/` stay out, they are the Forgejo's own. The tokens go to git in its
-  environment (`GIT_CONFIG_*`), never on its command line, and no one's git settings are read;
+  pruned of what the other has not; `refs/pull/` stay out, they are the Forgejo's own, and so do the branches its pull
+  requests are made from (`accordwimsy/pull/<n>`, below). GitHub's pull requests' heads come into the mirror too. The
+  tokens go to git in its environment (`GIT_CONFIG_*`), never on its command line, and no one's git settings are read;
 - its labels, made or edited as GitHub has them;
 - its issues and pull requests by their numbers, which the Forgejo then gives the same: a number GitHub has no more
   (deleted, moved to another repository) becomes a closed issue saying so, and a number the Forgejo gives otherwise
-  stops the repository, said, since its issues must start empty. A pull request is an issue saying it is one, its
-  branches (`fork:branch` into `main`), its state and where its changes are, since a mirror holds no fork's branch.
-  Each starts with its GitHub author, day and link; an edit on GitHub (its `updated_at`: title, text, state, labels)
-  edits it;
+  stops the repository, said, since its issues must start empty. A pull request is a pull request into the same
+  branch, from its head, which GitHub keeps for every one, a fork's too (`refs/pull/<n>/head`): pushed to the Forgejo
+  as the branch `accordwimsy/pull/<n>` while it is open, moved when GitHub's moves. One merged on GitHub is marked
+  merged by GitHub's merge commit (the repository allows a commit to mark it, `allow_manual_merge`), one closed is
+  closed, one reopened is reopened; once it is not open its branch goes, the pull request keeps its commits. A merge
+  commit the branch here does not hold (pushed over since) leaves it closed, said. Only one whose head or base branch
+  GitHub has no more is an issue, saying why, its branches (`fork:branch` into `main`), its state and where its
+  changes are. Each starts with its GitHub author, day and link; an edit on GitHub (its `updated_at`: title, text,
+  state, labels) edits it;
 - the comments, each with its GitHub author, day and link; one edited on GitHub is edited. One deleted there stays.
 
-Not mirrored: milestones (the organization has none, 2026-10-28), a comment's deletion, a release.
+Not mirrored: milestones (the organization has none, 2026-10-28), a comment's deletion, a release, a pull request's
+reviews and its comments on lines of its changes.
 
 A pass asks only for what changed since the last one (GitHub's `since`), keeps in `state.json` what it made (the next
-number, each issue's and comment's `updated_at`, the Forgejo's id of each comment), and writes it after each
+number, each issue's and comment's `updated_at`, the Forgejo's id of each comment, the state each pull request was
+left in), and writes it after each
 repository: a pass that stops goes on from there. One pass at a time: a second one, while one goes, says so and does
 nothing. What it did goes to stdout, what went wrong to stderr, which cron mails; the exit status is 1 when a
 repository stopped.
@@ -61,9 +69,9 @@ A key it does not know stops it, naming the key and its line; so does a value pa
 left empty. It goes out to `github.com` and `api.github.com` on 443 and to the Forgejo, nowhere else.
 
 Build and test: `make` and `make test` in `accordwimsy/` (FreeBSD packages: `git-lite`, `curl`, `pkgconf`,
-`ca_root_nss`). The tests run a fake GitHub and a fake Forgejo (its repositories, the issues' numbers, labels and
-comments) and git for real on bare repositories in a temporary folder: no network. In its jail: the binary in
-`/usr/local/bin/accordwimsy`, the env file as above, and the crontab line
+`ca_root_nss`). The tests run a fake GitHub and a fake Forgejo (its repositories, the issues' numbers, labels,
+comments, pull requests and what it refuses of them) and git for real on bare repositories in a temporary folder: no
+network. In its jail: the binary in `/usr/local/bin/accordwimsy`, the env file as above, and the crontab line
 `*/10 * * * * accordwimsy /usr/local/bin/accordwimsy sync`.
 
 ## ReiWimsy

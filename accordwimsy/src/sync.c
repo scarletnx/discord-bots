@@ -105,7 +105,8 @@ static cJSON* forgejo_all(Aw* a, const char* path) {
     }
 }
 
-/* ---- state.json: { "repos": { NAME: { "next", "issues_since", "comments_since", "seen", "comments" } } } ---- */
+/* ---- state.json: { "repos": { NAME: { "next", "issues_since", "comments_since", "seen", "comments", "pulls" } } };
+   "pulls": the numbers made as pull requests, each with the state it was left in here: "open", "closed", "merged" */
 static cJSON* child(cJSON* o, const char* key) {
     cJSON* c = cJSON_GetObjectItemCaseSensitive(o, key);
     if (!cJSON_IsObject(c)) {
@@ -156,12 +157,15 @@ static int ensure_repo(Aw* a, const cJSON* repo) {
     free(path);
     return rc;
 }
-/* what the repository says on GitHub, and its Releases tab off: releases stay on GitHub */
+/* what the repository says on GitHub, its Releases tab off (releases stay on GitHub), its pull requests on and a pull
+   request markable as merged by a commit of its own (GitHub's merge commit, AW_PULL_BRANCH's pull requests) */
 static int patch_repo(Aw* a, const cJSON* repo) {
     const char *name = jstr(repo, "name"), *branch = jstr(repo, "default_branch");
     char* path = aw_format("repos/%s/%s", a->config->forgejo_org, name);
     cJSON *edit = cJSON_CreateObject(), *got;
     cJSON_AddBoolToObject(edit, "has_releases", 0);
+    cJSON_AddBoolToObject(edit, "has_pull_requests", 1);
+    cJSON_AddBoolToObject(edit, "allow_manual_merge", 1);
     cJSON_AddBoolToObject(edit, "private", jbool(repo, "private"));
     cJSON_AddStringToObject(edit, "description", jstr(repo, "description") ? jstr(repo, "description") : "");
     cJSON_AddStringToObject(edit, "website", jstr(repo, "html_url") ? jstr(repo, "html_url") : "");
@@ -209,29 +213,30 @@ static int labels(Aw* a, const char* name, cJSON* ids) {
 
 /* ---- issues and pull requests ---- */
 static void day(const char* stamp, char out[11]) { snprintf(out, 11, "%.10s", stamp ? stamp : ""); }
-/* the text on the Forgejo: where it is from, then GitHub's body */
-static char* issue_body(Aw* a, const char* name, const cJSON* issue) {
-    const cJSON* pr = cJSON_GetObjectItemCaseSensitive(issue, "pull_request");
+/* GitHub's pull request part of an issue of its list, NULL for an issue */
+static const cJSON* pull_request(const cJSON* issue) { return cJSON_GetObjectItemCaseSensitive(issue, "pull_request"); }
+/* what GitHub says of a pull request: "merged", "open" or "closed" */
+static const char* pull_state(const cJSON* issue) {
+    return jstr(pull_request(issue), "merged_at")                                ? "merged"
+           : !strcmp(jstr(issue, "state") ? jstr(issue, "state") : "", "open") ? "open"
+                                                                                : "closed";
+}
+/* the text on the Forgejo: where it is from, then GitHub's body. A pull request (pull, GitHub's) says its branches and
+   its state; one made as an issue (note: why) says why, and where its changes are */
+static char* issue_body(const cJSON* issue, const cJSON* pull, const char* note) {
     const char *who = jstr(cJSON_GetObjectItemCaseSensitive(issue, "user"), "login"), *body = jstr(issue, "body");
     const char* url = jstr(issue, "html_url");
     char when[11];
     Buf b = {0};
     day(jstr(issue, "created_at"), when);
-    if (pr) {
-        char* path = aw_format("repos/%s/%s/pulls/%.0f", a->config->org, name, jnum(issue, "number"));
-        int status;
-        cJSON* pull = github(a, path, &status);
+    if (pull_request(issue)) {
         const char *head = pull ? jstr(cJSON_GetObjectItemCaseSensitive(pull, "head"), "label") : NULL,
                    *base = pull ? jstr(cJSON_GetObjectItemCaseSensitive(pull, "base"), "ref") : NULL;
-        const char* state = jstr(pr, "merged_at")             ? "merged"
-                            : !strcmp(jstr(issue, "state") ? jstr(issue, "state") : "", "open") ? "open"
-                                                                                                 : "closed";
-        buf_printf(&b, "> From GitHub: pull request [#%.0f](%s) by **@%s**, %s, from `%s` into `%s`, %s. Its changes: "
-                       "%s/files\n\n",
+        buf_printf(&b, "> From GitHub: pull request [#%.0f](%s) by **@%s**, %s, from `%s` into `%s`, %s.",
                    jnum(issue, "number"), url ? url : "", who ? who : "ghost", when, head ? head : "?",
-                   base ? base : "?", state, url ? url : "");
-        cJSON_Delete(pull);
-        free(path);
+                   base ? base : "?", pull_state(issue));
+        if (note) buf_printf(&b, " Made here as an issue: %s. Its changes: %s/files", note, url ? url : "");
+        buf_add(&b, "\n\n");
     } else
         buf_printf(&b, "> From GitHub: [#%.0f](%s), opened by **@%s** on %s.\n\n", jnum(issue, "number"),
                    url ? url : "", who ? who : "ghost", when);
@@ -257,12 +262,22 @@ static int set_state(Aw* a, const char* name, int number, int closed) {
     cJSON_Delete(got);
     return !got;
 }
-/* number made on the Forgejo, from issue or (NULL) as a number GitHub has no more: it must come back as number */
-static int create(Aw* a, const char* name, int number, const cJSON* issue, const cJSON* ids) {
+/* the Forgejo's number, made: it must come back as GitHub's, else the repository stops here */
+static int same_number(const char* name, int number, const cJSON* got) {
+    if ((int)jnum(got, "number") == number) return 1;
+    aw_warn("%s: GitHub #%d came out as the Forgejo's #%.0f: the numbers no longer match, %s stops here (the "
+            "Forgejo's issues must start empty)",
+            name, number, jnum(got, "number"), name);
+    return 0;
+}
+/* number made on the Forgejo as an issue, from issue (pull, GitHub's, and note for a pull request made as one) or
+   (NULL) as a number GitHub has no more: it must come back as number, which *made then says, whatever comes after */
+static int create_issue(Aw* a, const char* name, int number, const cJSON* issue, const cJSON* pull, const char* note,
+                        const cJSON* ids, int* made) {
     char* path = aw_format("repos/%s/%s/issues", a->config->forgejo_org, name);
     cJSON *make = cJSON_CreateObject(), *got;
     int closed = !issue || strcmp(jstr(issue, "state") ? jstr(issue, "state") : "", "open"), rc;
-    char* body = issue ? issue_body(a, name, issue)
+    char* body = issue ? issue_body(issue, pull, note)
                        : aw_format("> GitHub #%d is not there: deleted, or moved to another repository.", number);
     char* title = issue ? aw_strdup(jstr(issue, "title")) : aw_format("GitHub #%d (not there)", number);
     cJSON_AddStringToObject(make, "title", title);
@@ -271,13 +286,13 @@ static int create(Aw* a, const char* name, int number, const cJSON* issue, const
     cJSON_AddBoolToObject(make, "closed", closed);
     got = forgejo(a, "POST", path, make, 201, NULL);
     rc = !got;
-    if (got && (int)jnum(got, "number") != number) {
-        aw_warn("%s: GitHub #%d came out as the Forgejo's #%.0f: the numbers no longer match, %s stops here (the "
-                "Forgejo's issues must start empty)",
-                name, number, jnum(got, "number"), name);
+    if (got && !same_number(name, number, got))
         rc = 1;
-    } else if (got && closed && strcmp(jstr(got, "state") ? jstr(got, "state") : "", "closed"))
-        rc = set_state(a, name, number, 1);
+    else if (got) {
+        *made = 1;
+        if (closed && strcmp(jstr(got, "state") ? jstr(got, "state") : "", "closed"))
+            rc = set_state(a, name, number, 1);
+    }
     cJSON_Delete(got);
     cJSON_Delete(make);
     free(body);
@@ -285,30 +300,249 @@ static int create(Aw* a, const char* name, int number, const cJSON* issue, const
     free(path);
     return rc;
 }
-static int update(Aw* a, const char* name, int number, const cJSON* issue, const cJSON* ids) {
-    char *path = aw_format("repos/%s/%s/issues/%d", a->config->forgejo_org, name, number),
-         *labels_path = aw_format("repos/%s/%s/issues/%d/labels", a->config->forgejo_org, name, number);
-    char* body = issue_body(a, name, issue);
-    cJSON *edit = cJSON_CreateObject(), *tags = cJSON_CreateObject(), *got;
+/* labels as GitHub's on the Forgejo's number, an issue or a pull request */
+static int put_labels(Aw* a, const char* name, int number, const cJSON* issue, const cJSON* ids) {
+    char* path = aw_format("repos/%s/%s/issues/%d/labels", a->config->forgejo_org, name, number);
+    cJSON *tags = cJSON_CreateObject(), *got;
     int rc;
-    cJSON_AddStringToObject(edit, "title", jstr(issue, "title") ? jstr(issue, "title") : "");
-    cJSON_AddStringToObject(edit, "body", body);
-    cJSON_AddStringToObject(edit, "state", strcmp(jstr(issue, "state") ? jstr(issue, "state") : "", "open") ? "closed" : "open");
-    got = forgejo(a, "PATCH", path, edit, 201, NULL);
+    cJSON_AddItemToObject(tags, "labels", label_ids(issue, ids));
+    got = forgejo(a, "PUT", path, tags, 200, NULL);
     rc = !got;
     cJSON_Delete(got);
+    cJSON_Delete(tags);
+    free(path);
+    return rc;
+}
+/* GitHub's pull request number of name (owned), or NULL, said */
+static cJSON* github_pull(Aw* a, const char* name, int number) {
+    char* path = aw_format("repos/%s/%s/pulls/%d", a->config->org, name, number);
+    int status;
+    cJSON* pull = github(a, path, &status);
+    if (!pull) aw_warn("%s: GitHub's pull request #%d could not be read (HTTP %d)", name, number, status);
+    free(path);
+    return pull;
+}
+/* why GitHub's pull request number cannot be one here (owned), or NULL: a pull request is made from its head, which
+   GitHub keeps, into its base, which must be a branch still. *ref (owned, or NULL) the one the mirror has not */
+static char* pull_note(Aw* a, const char* name, int number, const cJSON* pull, char** ref) {
+    const char* base = jstr(cJSON_GetObjectItemCaseSensitive(pull, "base"), "ref");
+    *ref = NULL;
+    if (!aw_has_pull(a->config, name, number)) {
+        *ref = aw_format("refs/pull/%d/head", number);
+        return aw_strdup("its head is not on GitHub");
+    }
+    if (!base || !aw_has_branch(a->config, name, base)) {
+        *ref = base ? aw_format("refs/heads/%s", base) : NULL;
+        return aw_format("the branch it went into, %s, is not on GitHub any more", base ? base : "?");
+    }
+    return NULL;
+}
+/* an issue, or a pull request made as one (why said again), edited as GitHub has it */
+static int update_issue(Aw* a, const char* name, int number, const cJSON* issue, const cJSON* ids) {
+    char *path = aw_format("repos/%s/%s/issues/%d", a->config->forgejo_org, name, number), *note = NULL, *body, *ref;
+    cJSON *pull = NULL, *edit = cJSON_CreateObject(), *got;
+    int rc = 0;
+    if (pull_request(issue)) {
+        rc = !(pull = github_pull(a, name, number));
+        if (pull && !(note = pull_note(a, name, number, pull, &ref)))
+            note = aw_strdup("it was made so on an earlier pass");
+        if (pull) free(ref);
+    }
+    body = issue_body(issue, pull, note);
+    cJSON_AddStringToObject(edit, "title", jstr(issue, "title") ? jstr(issue, "title") : "");
+    cJSON_AddStringToObject(edit, "body", body);
+    cJSON_AddStringToObject(edit, "state",
+                            strcmp(jstr(issue, "state") ? jstr(issue, "state") : "", "open") ? "closed" : "open");
     if (!rc) {
-        cJSON_AddItemToObject(tags, "labels", label_ids(issue, ids));
-        got = forgejo(a, "PUT", labels_path, tags, 200, NULL);
+        got = forgejo(a, "PATCH", path, edit, 201, NULL);
         rc = !got;
         cJSON_Delete(got);
     }
+    if (!rc) rc = put_labels(a, name, number, issue, ids);
     cJSON_Delete(edit);
-    cJSON_Delete(tags);
+    cJSON_Delete(pull);
+    free(note);
     free(body);
     free(path);
-    free(labels_path);
     return rc;
+}
+
+/* ---- pull requests ---- */
+static char* github_git(const Aw* a, const char* name) {
+    return aw_format("%s/%s/%s.git", a->config->github, a->config->org, name);
+}
+static char* forgejo_git(const Aw* a, const char* name) {
+    return aw_format("%s/%s/%s.git", a->config->forgejo, a->config->forgejo_org, name);
+}
+/* POST pulls/<number>/merge, marking it merged by GitHub's merge commit, which the base branch here must hold: 1 when
+   done, else 0 and *status the HTTP status */
+static int merge_pull(Aw* a, const char* name, int number, const cJSON* pull, int* status) {
+    const char* commit = jstr(pull, "merge_commit_sha");
+    char* path = aw_format("repos/%s/%s/pulls/%d/merge", a->config->forgejo_org, name, number);
+    cJSON *merge = cJSON_CreateObject(), *got;
+    cJSON_AddStringToObject(merge, "Do", "manually-merged");
+    cJSON_AddStringToObject(merge, "MergeCommitID", commit ? commit : "");
+    got = forgejo(a, "POST", path, merge, 200, status);
+    cJSON_Delete(merge);
+    free(path);
+    if (!got) return 0;
+    cJSON_Delete(got);
+    return 1;
+}
+/* the Forgejo's AW_PULL_BRANCH of number gone, once its pull request is no more open: the pull request keeps its own
+   copy of the head (refs/pull/<number>/head). Missing already is fine */
+static void drop_branch(Aw* a, const char* name, int number) {
+    char* path = aw_format("repos/%s/%s/branches/" AW_PULL_BRANCH, a->config->forgejo_org, name, number);
+    int status;
+    cJSON_Delete(forgejo(a, "DELETE", path, NULL, 204, &status));
+    free(path);
+}
+/* the Forgejo's pull request number brought from the state it was left in (pulls) to GitHub's (want): reopened from
+   its head when GitHub's is open again or merged (a closed one cannot be marked merged), marked merged by GitHub's
+   merge commit, or closed; its AW_PULL_BRANCH goes once it is no more open. A merged one stays merged. A merge commit
+   the Forgejo refuses (409: the base branch here does not hold it, pushed over since) leaves it closed, said; any
+   other failure stops, for the next pass. 0, or 1 (said) */
+static int settle(Aw* a, const char* name, int number, const cJSON* pull, const char* want, cJSON* pulls) {
+    const char *had, *now, *commit = jstr(pull, "merge_commit_sha"),
+                          *base = jstr(cJSON_GetObjectItemCaseSensitive(pull, "base"), "ref");
+    char key[16], *to;
+    int rc = 0, status;
+    snprintf(key, sizeof key, "%d", number);
+    had = jstr(pulls, key);
+    now = !had || !strcmp(had, "open") ? "open" : !strcmp(had, "merged") ? "merged" : "closed";
+    if (!strcmp(now, want)) return 0;
+    if (!strcmp(now, "merged")) {
+        aw_warn("%s: #%d is merged here and %s on GitHub: it stays merged", name, number, want);
+        return 0;
+    }
+    if (!strcmp(now, "closed")) {
+        to = forgejo_git(a, name);
+        rc = aw_push_pull(a->config, name, to, number) || set_state(a, name, number, 0);
+        free(to);
+        if (rc) return 1;
+        set_string(pulls, key, now = "open");
+    }
+    if (!strcmp(want, "merged")) {
+        if (merge_pull(a, name, number, pull, &status))
+            now = "merged";
+        else if (status == 409) {
+            aw_warn("%s: #%d is merged on GitHub by %s, which %s here does not hold: it is closed here instead", name,
+                    number, commit ? commit : "no commit", base ? base : "its base");
+            rc = set_state(a, name, number, 1);
+            now = "closed";
+        } else {
+            aw_warn("%s: #%d could not be marked merged (HTTP %d): the next pass", name, number, status);
+            rc = 1;
+        }
+    } else if (!strcmp(want, "closed")) {
+        rc = set_state(a, name, number, 1);
+        now = "closed";
+    }
+    if (rc) return 1;
+    set_string(pulls, key, now);
+    if (strcmp(now, "open")) drop_branch(a, name, number);
+    return 0;
+}
+/* number made on the Forgejo as a pull request from GitHub's (pull): its head pushed as AW_PULL_BRANCH, the pull
+   request into the same base, then its state as GitHub's. It must come back as number, which *made then says, whatever
+   comes after */
+static int make_pull(Aw* a, const char* name, int number, const cJSON* issue, const cJSON* pull, const cJSON* ids,
+                     cJSON* pulls, int* made) {
+    char *to = forgejo_git(a, name), *path = aw_format("repos/%s/%s/pulls", a->config->forgejo_org, name),
+         *head = aw_format(AW_PULL_BRANCH, number), *body = issue_body(issue, pull, NULL), key[16];
+    cJSON *make = cJSON_CreateObject(), *got = NULL;
+    int rc = aw_push_pull(a->config, name, to, number);
+    snprintf(key, sizeof key, "%d", number);
+    if (!rc) {
+        cJSON_AddStringToObject(make, "title", jstr(issue, "title") ? jstr(issue, "title") : "");
+        cJSON_AddStringToObject(make, "body", body);
+        cJSON_AddStringToObject(make, "head", head);
+        cJSON_AddStringToObject(make, "base", jstr(cJSON_GetObjectItemCaseSensitive(pull, "base"), "ref"));
+        cJSON_AddItemToObject(make, "labels", label_ids(issue, ids));
+        got = forgejo(a, "POST", path, make, 201, NULL);
+        rc = !got || !same_number(name, number, got);
+    }
+    if (!rc) {
+        *made = 1;
+        set_string(pulls, key, "open");
+        rc = settle(a, name, number, pull, pull_state(issue), pulls);
+    }
+    cJSON_Delete(got);
+    cJSON_Delete(make);
+    free(body);
+    free(head);
+    free(path);
+    free(to);
+    return rc;
+}
+/* a pull request made here as one, edited as GitHub has it: its title and text, its base while open, its labels, its
+   head moved, then its state */
+static int update_pull(Aw* a, const char* name, int number, const cJSON* issue, const cJSON* ids, cJSON* pulls) {
+    cJSON *pull = github_pull(a, name, number), *edit = cJSON_CreateObject(), *got;
+    char *path = aw_format("repos/%s/%s/pulls/%d", a->config->forgejo_org, name, number), *to = forgejo_git(a, name),
+         *body = issue_body(issue, pull, NULL), key[16];
+    const char *want = pull_state(issue), *base = jstr(cJSON_GetObjectItemCaseSensitive(pull, "base"), "ref");
+    int rc = !pull, open_here;
+    snprintf(key, sizeof key, "%d", number);
+    open_here = !jstr(pulls, key) || !strcmp(jstr(pulls, key), "open");
+    cJSON_AddStringToObject(edit, "title", jstr(issue, "title") ? jstr(issue, "title") : "");
+    cJSON_AddStringToObject(edit, "body", body);
+    /* a new base on GitHub, while it is open and the branch is there to go into */
+    if (open_here && !strcmp(want, "open") && base && aw_has_branch(a->config, name, base))
+        cJSON_AddStringToObject(edit, "base", base);
+    if (!rc) {
+        got = forgejo(a, "PATCH", path, edit, 201, NULL);
+        rc = !got;
+        cJSON_Delete(got);
+    }
+    if (!rc) rc = put_labels(a, name, number, issue, ids);
+    if (!rc && open_here && strcmp(want, "closed")) rc = aw_push_pull(a->config, name, to, number); /* new commits */
+    if (!rc) rc = settle(a, name, number, pull, want, pulls);
+    cJSON_Delete(edit);
+    cJSON_Delete(pull);
+    free(body);
+    free(to);
+    free(path);
+    return rc;
+}
+
+/* number made on the Forgejo from GitHub's issue (NULL: a number GitHub has no more): a pull request as one, or as an
+   issue saying why when it cannot be: what the mirror has not, GitHub has not either. One GitHub has after all came
+   after this pass's fetch: it stops here, for the next pass. *made once the Forgejo has number: a failure after it
+   (its state, its merge) leaves it to the next pass's update, as it would make it twice */
+static int create(Aw* a, const char* name, int number, const cJSON* issue, const cJSON* ids, cJSON* st, int* made) {
+    cJSON* pull;
+    char *note, *ref, *from;
+    int rc, has = 0;
+    *made = 0;
+    if (!issue || !pull_request(issue)) return create_issue(a, name, number, issue, NULL, NULL, ids, made);
+    if (!(pull = github_pull(a, name, number))) return 1;
+    note = pull_note(a, name, number, pull, &ref);
+    if (ref) {
+        from = github_git(a, name);
+        has = aw_remote_has(a->config, name, from, ref);
+        if (has == 1) aw_log("%s: #%d's %s came after this pass's fetch: the next pass makes it", name, number, ref);
+        free(from);
+        free(ref);
+    }
+    if (has)
+        rc = 1;
+    else if (note) {
+        aw_log("%s: #%d, a pull request, made as an issue: %s", name, number, note);
+        rc = create_issue(a, name, number, issue, pull, note, ids, made);
+    } else
+        rc = make_pull(a, name, number, issue, pull, ids, child(st, "pulls"), made);
+    free(note);
+    cJSON_Delete(pull);
+    return rc;
+}
+/* number edited on the Forgejo as GitHub's issue has it, as a pull request when it was made one */
+static int update(Aw* a, const char* name, int number, const cJSON* issue, const cJSON* ids, cJSON* st) {
+    char key[16];
+    snprintf(key, sizeof key, "%d", number);
+    if (pull_request(issue) && jstr(child(st, "pulls"), key))
+        return update_pull(a, name, number, issue, ids, child(st, "pulls"));
+    return update_issue(a, name, number, issue, ids);
 }
 static int by_number(const void* x, const void* y) {
     double a = jnum(*(cJSON* const*)x, "number"), b = jnum(*(cJSON* const*)y, "number");
@@ -322,6 +556,7 @@ static int issues(Aw* a, const char* name, cJSON* st, const cJSON* ids) {
     cJSON *list = github_all(a, path), *seen = child(st, "seen"), *item;
     cJSON** sorted;
     int next = jnum(st, "next") >= 1 ? (int)jnum(st, "next") : 1, count = list ? cJSON_GetArraySize(list) : 0, i, rc = !list;
+    int made;
     char latest[32] = "";
     free(path);
     sorted = calloc((size_t)count + 1, sizeof *sorted);
@@ -333,15 +568,15 @@ static int issues(Aw* a, const char* name, cJSON* st, const cJSON* ids) {
         char key[16];
         snprintf(key, sizeof key, "%d", number);
         while (!rc && next < number) { /* a number GitHub has no more */
-            rc = create(a, name, next, NULL, ids);
-            if (!rc) aw_log("%s: #%d made, as GitHub has it no more", name, next++);
+            rc = create(a, name, next, NULL, ids, st, &made);
+            if (made) aw_log("%s: #%d made, as GitHub has it no more", name, next++);
         }
         if (rc) break;
         if (number == next) {
-            rc = create(a, name, number, sorted[i], ids);
-            if (!rc) next++;
+            rc = create(a, name, number, sorted[i], ids, st, &made);
+            if (made) next++;
         } else if (!jstr(seen, key) || strcmp(jstr(seen, key), updated ? updated : ""))
-            rc = update(a, name, number, sorted[i], ids);
+            rc = update(a, name, number, sorted[i], ids, st);
         if (!rc) {
             set_string(seen, key, updated ? updated : "");
             if (updated && strcmp(updated, latest) > 0) snprintf(latest, sizeof latest, "%s", updated);
@@ -419,8 +654,7 @@ static int comments(Aw* a, const char* name, cJSON* st) {
 /* ---- a pass ---- */
 static int one(Aw* a, const cJSON* repo, cJSON* repos) {
     const char* name = jstr(repo, "name");
-    char *from = aw_format("%s/%s/%s.git", a->config->github, a->config->org, name),
-         *to = aw_format("%s/%s/%s.git", a->config->forgejo, a->config->forgejo_org, name);
+    char *from = github_git(a, name), *to = forgejo_git(a, name);
     cJSON *st = child(repos, name), *ids = cJSON_CreateObject();
     int rc = ensure_repo(a, repo) || aw_mirror(a->config, name, from, to) || patch_repo(a, repo) ||
              labels(a, name, ids) || issues(a, name, st, ids) || comments(a, name, st);
