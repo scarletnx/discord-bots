@@ -1,6 +1,7 @@
 name: Tests
 
-# ReiWimsy's tests (make -C rei test: no Discord, no network, no Concord), Xuji's and AogoWimsy's, on each pull request
+# ReiWimsy's tests (make -C rei test: no Discord, no network, no Concord), AccordWimsy's (libcurl's headers, no network),
+# Xuji's and AogoWimsy's, on each pull request
 # and each push to main
 on:
   push:
@@ -18,5 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: make -C rei test
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev
+      - run: make -C accordwimsy test
       - run: python3 xuji/test_xuji.py
       - run: python3 aogo/test_aogowimsy.py
