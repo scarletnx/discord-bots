@@ -3,6 +3,7 @@
 /* AccordWimsy: the repositories of a GitHub organization, the same on a Forgejo, a pass at a time (cron)
 
      accordwimsy sync [ENV FILE]     default /usr/local/etc/accordwimsy/accordwimsy.env
+     accordwimsy status [ENV FILE]   each repository's last good pass, and what waits out the grace
 
    One pass at a time: a second one, while one goes, says so and does nothing. */
 #include "aw.h"
@@ -16,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ENV_FILE "/usr/local/etc/accordwimsy/accordwimsy.env"
@@ -46,13 +48,24 @@ int main(int argc, char** argv) {
     Aw a;
     char why[1024], *lock_path, *mirrors;
     int lock, rc;
-    if (argc < 2 || strcmp(argv[1], "sync") || argc > 3) {
-        fprintf(stderr, "usage: accordwimsy sync [ENV FILE]   (default %s)\n", ENV_FILE);
+    if (argc < 2 || (strcmp(argv[1], "sync") && strcmp(argv[1], "status")) || argc > 3) {
+        fprintf(stderr, "usage: accordwimsy sync|status [ENV FILE]   (default %s)\n", ENV_FILE);
         return 2;
     }
     if (aw_config_read(&config, argc == 3 ? argv[2] : ENV_FILE, why, sizeof why)) {
         aw_warn("%s", why);
         return 2;
+    }
+    if (!strcmp(argv[1], "status")) { /* reads state.json, as a pass going leaves it after each repository */
+        memset(&a, 0, sizeof a);
+        a.config = &config;
+        a.now = (long)time(NULL);
+        a.state_path = aw_format("%s/state.json", config.state);
+        a.state = load(a.state_path);
+        aw_status(&a);
+        cJSON_Delete(a.state);
+        free(a.state_path);
+        return 0;
     }
     mirrors = aw_format("%s/mirrors", config.state);
     if ((mkdir(config.state, 0700) && errno != EEXIST) || (mkdir(mirrors, 0700) && errno != EEXIST)) {
@@ -81,6 +94,7 @@ int main(int argc, char** argv) {
     }
     memset(&a, 0, sizeof a);
     a.config = &config;
+    a.now = (long)time(NULL);
     a.fetch = aw_http;
     a.state_path = aw_format("%s/state.json", config.state);
     a.state = load(a.state_path);

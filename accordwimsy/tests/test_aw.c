@@ -14,6 +14,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int checks, failures;
@@ -455,11 +456,37 @@ static int next_of(const cJSON* state) {
     return (int)jnum(game, "next");
 }
 
+/* path's text (owned), "" when it cannot be read */
+static char* slurp(const char* path) {
+    FILE* f = fopen(path, "rb");
+    Buf b = {0};
+    char chunk[1024];
+    size_t n;
+    if (!f) return aw_strdup("");
+    while ((n = fread(chunk, 1, sizeof chunk, f))) buf_addn(&b, chunk, n);
+    fclose(f);
+    return buf_take(&b);
+}
+/* game's "gone" in state.json */
+static const cJSON* gone_of(const cJSON* state) {
+    const cJSON* game = cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(state, "repos"), "game");
+    return cJSON_GetObjectItemCaseSensitive(game, "gone");
+}
+/* the time each pass runs at, moved on by the cases that wait out a grace */
+static long now_t = 1792800000;
+static void stamp_of(long t, char out[32]) {
+    time_t at = (time_t)t;
+    struct tm tm;
+    gmtime_r(&at, &tm);
+    strftime(out, 32, "%Y%m%d-%H%M%S", &tm);
+}
+
 static int pass(AwConfig* c, cJSON* state, long* written) {
     Aw a;
     int rc;
     memset(&a, 0, sizeof a);
     a.config = c;
+    a.now = now_t;
     a.fetch = fake;
     a.state = state;
     a.state_path = aw_format("%s/state/state.json", root);
@@ -494,12 +521,13 @@ int main(void) {
         FILE* f = fopen(env, "w");
         fprintf(f, "# a comment\n\nACCORDWIMSY_FORGEJO=" FJ "/\nACCORDWIMSY_FORGEJO_TOKEN=fj-token\nGITHUB_TOKEN=gh-token\n"
                    "ACCORDWIMSY_ORG=org\nACCORDWIMSY_GITHUB_API=" GH_API "\nACCORDWIMSY_GITHUB=file://%s/gh\n"
-                   "ACCORDWIMSY_STATE=%s/state\nACCORDWIMSY_GIT=git\n",
-                root, root, root);
+                   "ACCORDWIMSY_STATE=%s/state\nACCORDWIMSY_GIT=git\nACCORDWIMSY_FRESH=%s/fresh\n",
+                root, root, root, root);
         fclose(f);
     }
     CHECK(!aw_config_read(&c, env, why, sizeof why));
     CHECK(!strcmp(c.forgejo_org, "org") && !strcmp(c.forgejo_user, "accordwimsy") && c.forgejo[strlen(c.forgejo) - 1] != '/');
+    CHECK(c.grace == 7 * 86400L);
     {
         AwConfig bad;
         char* wrong = aw_format("%s/bad.env", root);
@@ -507,6 +535,11 @@ int main(void) {
         fprintf(f, "ACCORDWIMSY_FORGEJO=x\nACCORDWIMSY_FORGEJO_TOKEN=t\nGITHUB_TOKN=t\n");
         fclose(f);
         CHECK(aw_config_read(&bad, wrong, why, sizeof why) && strstr(why, "bad.env:3: GITHUB_TOKN is no key"));
+        f = fopen(wrong, "w");
+        fprintf(f, "ACCORDWIMSY_FORGEJO=x\nACCORDWIMSY_FORGEJO_TOKEN=t\nGITHUB_TOKEN=t\nACCORDWIMSY_GRACE_DAYS=7d\n");
+        fclose(f);
+        CHECK(aw_config_read(&bad, wrong, why, sizeof why) &&
+              strstr(why, "ACCORDWIMSY_GRACE_DAYS is \"7d\", no number of days"));
         f = fopen(wrong, "w");
         fprintf(f, "ACCORDWIMSY_FORGEJO_TOKEN=t\nGITHUB_TOKEN=t\n");
         fclose(f);
@@ -531,10 +564,11 @@ int main(void) {
               "git init --bare --quiet %s/gh/org/empty.git",
               root, root, root, root, root));
     CHECK(!sh("cd %s/work && git init --quiet -b main && git -c user.name=T -c user.email=t@t commit --quiet "
-              "--allow-empty -m one && git branch feature && git tag v1 && git tag old && git switch --quiet -c fix-sound && "
+              "--allow-empty -m one && git branch feature && git branch topic && git tag v1 && git tag old && "
+              "git switch --quiet -c fix-sound && "
               "git commit --quiet --allow-empty -m fix && git switch --quiet main && "
               "git merge --quiet --no-ff -m 'Merge #2' fix-sound && git remote add origin %s/gh/org/game.git && "
-              "git push --quiet origin main feature v1 old fix-sound:refs/pull/2/head",
+              "git push --quiet origin main feature topic v1 old fix-sound:refs/pull/2/head",
               root, root));
     merged2 = rev("gh", "game", "refs/heads/main");
     github("orgs/org/repos?type=all&sort=full_name",
@@ -636,9 +670,49 @@ int main(void) {
     CHECK(game && game->ncomments == 3 && strstr(game->comments[0].body, "Same here, on 2.0.") &&
           game->comments[2].issue == 5);
     fj_refs = refs("fj", "game");
-    CHECK(!strstr(fj_refs, "refs/heads/feature") && strstr(fj_refs, "refs/heads/main") && strstr(fj_refs, "refs/tags/v1") &&
-          !strstr(fj_refs, "refs/tags/old"));
+    CHECK(strstr(fj_refs, "refs/heads/feature") && strstr(fj_refs, "refs/heads/main") &&
+          strstr(fj_refs, "refs/tags/v1") && strstr(fj_refs, "refs/tags/old"));
     free(fj_refs);
+    /* what GitHub has no more stays its grace: the branch and the tag deleted there are still here, seen gone now */
+    CHECK(jnum(gone_of(state), "refs/heads/feature") == now_t && jnum(gone_of(state), "refs/tags/old") == now_t);
+
+    /* 3 days on: the tag back on GitHub, and topic rewritten there (a force-push). The tag stays, gone no more; topic
+       is GitHub's here too, its old tip kept as a branch of its own; feature is still here */
+    github("repos/org/game/issues/comments?sort=updated&direction=asc&since=2026-10-06T12:00:00Z", "[]");
+    issues_since("2026-10-06T10:00:00Z", 0);
+    {
+        char *old_topic = rev("gh", "game", "refs/heads/topic"), *kept, *at, stamp[32], *ours, *theirs;
+        now_t += 3 * 86400;
+        stamp_of(now_t, stamp);
+        kept = aw_format("accordwimsy/kept/branch/topic/%s", stamp);
+        at = aw_format("refs/heads/%s", kept);
+        CHECK(!sh("cd %s/work && git push --quiet origin old && git switch --quiet --orphan other && "
+                  "git commit --quiet --allow-empty -m other && git push --quiet --force origin other:topic && "
+                  "git switch --quiet main",
+                  root));
+        CHECK(pass(&c, state, NULL) == 0);
+        CHECK(!cJSON_GetObjectItemCaseSensitive(gone_of(state), "refs/tags/old") &&
+              jnum(gone_of(state), "refs/heads/feature") == now_t - 3 * 86400 && jnum(gone_of(state), at) == now_t);
+        ours = rev("fj", "game", "refs/heads/topic");
+        theirs = rev("gh", "game", "refs/heads/topic");
+        CHECK(theirs[0] && strcmp(theirs, old_topic) && !strcmp(ours, theirs));
+        free(ours);
+        ours = rev("fj", "game", at);
+        CHECK(old_topic[0] && !strcmp(ours, old_topic));
+        free(ours);
+        ours = rev("fj", "game", "refs/tags/old");
+        CHECK(ours[0] && game && has_branch(game, "feature"));
+        free(ours);
+        /* 10 days after feature went: deleted here, and the kept tip, 7 days old, too */
+        now_t += 7 * 86400;
+        CHECK(pass(&c, state, NULL) == 0);
+        CHECK(game && !has_branch(game, "feature") && !has_branch(game, kept) && has_branch(game, "topic"));
+        CHECK(gone_of(state) && !gone_of(state)->child);
+        free(theirs);
+        free(at);
+        free(kept);
+        free(old_topic);
+    }
 
     /* pull requests: #6 from a fork's branch, which GitHub has only as refs/pull/6/head, open, labelled; #7 closed; #8
        into a branch gone and #9 with no head kept, issues saying why; #10 merged by a commit main does not hold (pushed
@@ -671,8 +745,9 @@ int main(void) {
            repository stops there, #6 not made, and the next pass makes it */
         char* late = aw_format("%s/late-git", root);
         FILE* f = fopen(late, "w");
-        fprintf(f, "#!/bin/sh\ngit \"$@\" || exit\n"
-                   "if [ \"$2\" = fetch ]; then git \"$1\" update-ref -d refs/pull/6/head; fi\n");
+        fprintf(f, "#!/bin/sh\ngit \"$@\" || exit\nd= f=\n"
+                   "for a in \"$@\"; do case \"$a\" in --git-dir=*) d=$a ;; fetch) f=1 ;; esac; done\n"
+                   "if [ -n \"$f\" ]; then git \"$d\" update-ref -d refs/pull/6/head; fi\n");
         fclose(f);
         chmod(late, 0755);
         snprintf(c.git, sizeof c.git, "%s", late);
@@ -787,6 +862,34 @@ int main(void) {
               game->issues[1].merged && !strcmp(game->issues[1].state, "closed"));
         CHECK(game && game->issues[9].pull && !strcmp(game->issues[9].state, "open") &&
               has_branch(game, "accordwimsy/pull/10"));
+    }
+
+    /* the freshness file: each repository GitHub lists, with its last good pass */
+    {
+        char *fresh = aw_format("%s/fresh", root), *text = slurp(fresh), *line = aw_format("game %ld\n", now_t);
+        CHECK(strstr(text, line) && strstr(text, "empty "));
+        free(line);
+        free(text);
+        /* GitHub lists empty no more: said once, its copy here left as it is, out of the freshness file; status
+           says so, and game's last good pass */
+        github("orgs/org/repos?type=all&sort=full_name",
+               "[{\"name\":\"game\",\"private\":false,\"description\":\"A game\",\"default_branch\":\"main\","
+               "\"html_url\":\"https://github.com/org/game\"}]");
+        CHECK(pass(&c, state, NULL) == 0);
+        CHECK(jnum(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(state, "repos"), "empty"),
+                   "missing") == now_t);
+        text = slurp(fresh);
+        CHECK(strstr(text, "game ") && !strstr(text, "empty "));
+        free(text);
+        free(fresh);
+        {
+            char *command = aw_format("./accordwimsy status %s 2>&1", env), out[2048] = "", got[256];
+            FILE* p = popen(command, "r");
+            while (p && fgets(got, sizeof got, p)) strncat(out, got, sizeof out - strlen(out) - 1);
+            CHECK(p && pclose(p) == 0);
+            CHECK(strstr(out, "game: last good pass ") && strstr(out, "empty: not on GitHub since "));
+            free(command);
+        }
     }
 
     /* a Forgejo whose next number is not GitHub's: said, the repository stopped, the state where it was */

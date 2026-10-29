@@ -2,9 +2,11 @@
    Copyright 2026 the ScarletNX contributors */
 #include "sync.h"
 #include "git.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* ---- the two APIs ---- */
 /* a request's JSON answer (owned), or NULL; *status its HTTP status. A failure (no answer, or a status but want's and
@@ -52,7 +54,7 @@ static cJSON* github_all(Aw* a, const char* path) {
         int n = 0;
         free(paged);
         if (!cJSON_IsArray(got)) {
-            if (got || status == 200) aw_warn("GET %s: no list came", path);
+            aw_warn("GET %s: no list came (HTTP %d)", path, status);
             cJSON_Delete(got);
             cJSON_Delete(all);
             return NULL;
@@ -105,8 +107,10 @@ static cJSON* forgejo_all(Aw* a, const char* path) {
     }
 }
 
-/* ---- state.json: { "repos": { NAME: { "next", "issues_since", "comments_since", "seen", "comments", "pulls" } } };
-   "pulls": the numbers made as pull requests, each with the state it was left in here: "open", "closed", "merged" */
+/* ---- state.json: { "repos": { NAME: { "next", "issues_since", "comments_since", "seen", "comments", "pulls", "gone",
+   "ok", "missing" } } }; "pulls": the numbers made as pull requests, each with the state it was left in here: "open",
+   "closed", "merged"; "gone": each ref the Forgejo has and GitHub has no more, with when it was first seen so; "ok":
+   when the repository's last pass went through; "missing": since when GitHub has not listed it */
 static cJSON* child(cJSON* o, const char* key) {
     cJSON* c = cJSON_GetObjectItemCaseSensitive(o, key);
     if (!cJSON_IsObject(c)) {
@@ -213,6 +217,12 @@ static int labels(Aw* a, const char* name, cJSON* ids) {
 
 /* ---- issues and pull requests ---- */
 static void day(const char* stamp, char out[11]) { snprintf(out, 11, "%.10s", stamp ? stamp : ""); }
+/* t (seconds since the epoch) as format, in UTC, into out */
+static void when_of(long t, const char* format, char* out, size_t size) {
+    time_t at = (time_t)t;
+    struct tm tm;
+    if (!gmtime_r(&at, &tm) || !strftime(out, size, format, &tm)) snprintf(out, size, "%ld", t);
+}
 /* GitHub's pull request part of an issue of its list, NULL for an issue */
 static const cJSON* pull_request(const cJSON* issue) { return cJSON_GetObjectItemCaseSensitive(issue, "pull_request"); }
 /* what GitHub says of a pull request: "merged", "open" or "closed" */
@@ -544,6 +554,68 @@ static int update(Aw* a, const char* name, int number, const cJSON* issue, const
         return update_pull(a, name, number, issue, ids, child(st, "pulls"));
     return update_issue(a, name, number, issue, ids);
 }
+/* whether line is one of list's lines */
+static int has_line(const char* list, const char* line) {
+    size_t n = strlen(line);
+    const char* at;
+    for (at = list; (at = strstr(at, line)) != NULL; at += n)
+        if ((at == list || at[-1] == '\n') && (at[n] == '\n' || !at[n])) return 1;
+    return 0;
+}
+/* what the Forgejo has and GitHub has no more (stale, a ref a line, from aw_mirror): each one stays the grace from when
+   it was first seen gone, said then, and is deleted after it; one on GitHub again before that just stays. An
+   AW_KEPT_BRANCH one counts from when it was kept, which was said already. 0, or 1 (said) */
+static int grace(Aw* a, const char* name, cJSON* st, const char* stale) {
+    static const char kept_prefix[] = "refs/heads/" AW_KEPT_BRANCH "/";
+    cJSON *gone = child(st, "gone"), *g, *next;
+    const char *line, *end;
+    char when[16], *to;
+    Buf due = {0};
+    int rc = 0;
+    if (!stale) return 0;
+    for (g = gone->child; g; g = next) {
+        next = g->next;
+        if (has_line(stale, g->string)) continue;
+        if (strncmp(g->string, kept_prefix, sizeof kept_prefix - 1))
+            aw_log("%s: %s is on GitHub again: it stays here", name, g->string);
+        cJSON_DeleteItemFromObjectCaseSensitive(gone, g->string);
+    }
+    for (line = stale; *line; line = *end ? end + 1 : end) {
+        const cJSON* since;
+        char* ref;
+        end = strchr(line, '\n') ? strchr(line, '\n') : line + strlen(line);
+        if (end == line) continue;
+        ref = aw_format("%.*s", (int)(end - line), line);
+        if (!cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(gone, ref))) {
+            set_number(gone, ref, a->now);
+            when_of(a->now + a->config->grace, "%Y-%m-%d", when, sizeof when);
+            if (a->config->grace && strncmp(ref, kept_prefix, sizeof kept_prefix - 1))
+                aw_warn("%s: %s is gone from GitHub: it stays here until %s, then it is deleted", name, ref, when);
+        }
+        since = cJSON_GetObjectItemCaseSensitive(gone, ref);
+        if (a->now - (long)since->valuedouble >= a->config->grace) buf_printf(&due, "%s\n", ref);
+        free(ref);
+    }
+    if (due.len) {
+        to = forgejo_git(a, name);
+        rc = aw_delete_refs(a->config, name, to, due.text);
+        for (line = due.text; !rc && *line; line = *end ? end + 1 : end) {
+            char* ref;
+            end = strchr(line, '\n') ? strchr(line, '\n') : line + strlen(line);
+            ref = aw_format("%.*s", (int)(end - line), line);
+            when_of((long)jnum(gone, ref), "%Y-%m-%d", when, sizeof when);
+            if (a->config->grace)
+                aw_log("%s: %s deleted here, gone from GitHub since %s", name, ref, when);
+            else
+                aw_warn("%s: %s deleted here: GitHub has it no more", name, ref);
+            cJSON_DeleteItemFromObjectCaseSensitive(gone, ref);
+            free(ref);
+        }
+        free(to);
+    }
+    buf_free(&due);
+    return rc;
+}
 /* the pull requests left open here that the Forgejo has closed under the sync (their branch deleted: a --prune push did,
    2026-10-28): each one's head pushed again and the pull request reopened, GitHub's state coming on with its next
    edit; one the Forgejo has merged is recorded so. 0, or 1 (said) */
@@ -695,15 +767,60 @@ static int comments(Aw* a, const char* name, cJSON* st) {
 /* ---- a pass ---- */
 static int one(Aw* a, const cJSON* repo, cJSON* repos) {
     const char* name = jstr(repo, "name");
-    char *from = github_git(a, name), *to = forgejo_git(a, name);
+    char *from = github_git(a, name), *to = forgejo_git(a, name), *stale = NULL, stamp[32];
     cJSON *st = child(repos, name), *ids = cJSON_CreateObject();
-    int rc = ensure_repo(a, repo) || aw_mirror(a->config, name, from, to) || patch_repo(a, repo) ||
-             labels(a, name, ids) || keep_open(a, name, st) || issues(a, name, st, ids) || comments(a, name, st);
+    int rc;
+    if (cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(st, "missing"))) {
+        aw_log("%s: on GitHub again", name);
+        cJSON_DeleteItemFromObjectCaseSensitive(st, "missing");
+    }
+    when_of(a->now, "%Y%m%d-%H%M%S", stamp, sizeof stamp);
+    rc = ensure_repo(a, repo) || aw_mirror(a->config, name, from, to, stamp, &stale) || patch_repo(a, repo) ||
+         labels(a, name, ids) || grace(a, name, st, stale) || keep_open(a, name, st) || issues(a, name, st, ids) ||
+         comments(a, name, st);
+    if (!rc) set_number(st, "ok", a->now);
     save(a);
     cJSON_Delete(ids);
+    free(stale);
     free(from);
     free(to);
     return rc;
+}
+/* each repository GitHub listed, with when its last pass went through (0: none yet), "<name> <seconds since the
+   epoch>" a line, written over a->config->fresh: the host reads it to tell a copy that lags. The file is made by
+   the operator, in a directory only root writes, so that what root reads cannot be swapped for another file */
+static void write_fresh(Aw* a, const cJSON* list, const cJSON* repos) {
+    FILE* f = fopen(a->config->fresh, "w");
+    const cJSON* repo;
+    Buf b = {0};
+    int failed;
+    if (!f) {
+        aw_warn("%s: %s: the host cannot tell whether the copy is up to date", a->config->fresh, strerror(errno));
+        return;
+    }
+    for (repo = list->child; repo; repo = repo->next) {
+        const char* name = jstr(repo, "name");
+        if (name) buf_printf(&b, "%s %.0f\n", name, jnum(cJSON_GetObjectItemCaseSensitive(repos, name), "ok"));
+    }
+    failed = b.len && fwrite(b.text, 1, b.len, f) != b.len;
+    if (fclose(f)) failed = 1;
+    if (failed) aw_warn("%s: cannot be written: the host cannot tell whether the copy is up to date", a->config->fresh);
+    buf_free(&b);
+}
+/* the repositories state.json has and GitHub listed no more (list): each said once, its copy here left as it is */
+static void missing(Aw* a, const cJSON* list, cJSON* repos) {
+    cJSON* st;
+    const cJSON* repo;
+    for (st = repos->child; st; st = st->next) {
+        for (repo = list->child; repo && strcmp(jstr(repo, "name") ? jstr(repo, "name") : "", st->string);
+             repo = repo->next)
+            continue;
+        if (repo || cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(st, "missing"))) continue;
+        set_number(st, "missing", a->now);
+        aw_warn("%s is not on GitHub any more (deleted, made private to the token, or moved): its copy here stays as "
+                "it is",
+                st->string);
+    }
 }
 int aw_sync(Aw* a) {
     char* path = aw_format("orgs/%s/repos?type=all&sort=full_name", a->config->org);
@@ -720,8 +837,39 @@ int aw_sync(Aw* a) {
             a->failures++;
         }
     }
+    missing(a, list, repos);
+    save(a);
+    write_fresh(a, list, repos);
     aw_log("%d repositories, %ld write(s) on the Forgejo%s", cJSON_GetArraySize(list), a->writes,
            a->failures ? ", some stopped" : "");
     cJSON_Delete(list);
     return a->failures != 0;
+}
+
+void aw_status(const Aw* a) {
+    const cJSON *repos = cJSON_GetObjectItemCaseSensitive(a->state, "repos"), *r, *g;
+    char at[32], until[16];
+    if (!repos || !repos->child) {
+        printf("nothing synced yet (%s)\n", a->state_path);
+        return;
+    }
+    for (r = repos->child; r; r = r->next) {
+        long ok = (long)jnum(r, "ok");
+        if (cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(r, "missing"))) {
+            when_of((long)jnum(r, "missing"), "%Y-%m-%d", at, sizeof at);
+            printf("%s: not on GitHub since %s, its copy here left as it is\n", r->string, at);
+        } else if (ok) {
+            when_of(ok, "%Y-%m-%d %H:%M UTC", at, sizeof at);
+            printf("%s: last good pass %s, %ld minute(s) ago\n", r->string, at, (a->now - ok) / 60);
+        } else
+            printf("%s: no good pass yet\n", r->string);
+        const cJSON* gone = cJSON_GetObjectItemCaseSensitive(r, "gone");
+        for (g = gone ? gone->child : NULL; g; g = g->next) {
+            int kept = !strncmp(g->string, "refs/heads/" AW_KEPT_BRANCH "/", strlen("refs/heads/" AW_KEPT_BRANCH "/"));
+            when_of((long)g->valuedouble, "%Y-%m-%d", at, sizeof at);
+            when_of((long)g->valuedouble + a->config->grace, "%Y-%m-%d", until, sizeof until);
+            printf("  %s: %s %s, deleted here on %s\n", g->string, kept ? "kept since" : "gone from GitHub since", at,
+                   until);
+        }
+    }
 }

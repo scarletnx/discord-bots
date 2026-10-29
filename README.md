@@ -23,10 +23,15 @@ port. A pass, `accordwimsy sync [ENV FILE]`, for each repository of the organiza
 
 - the repository on the Forgejo, made in its organization when it is not there, with GitHub's name, description and
   visibility, its default branch, and its Releases tab off (releases stay on GitHub);
-- its branches and tags, through a bare mirror in `mirrors/`: fetched from GitHub and pushed to the Forgejo, each side
-  pruned of what the other has not; `refs/pull/` stay out, they are the Forgejo's own, and so do the branches its pull
-  requests are made from (`accordwimsy/pull/<n>`, below). GitHub's pull requests' heads come into the mirror too. The
-  tokens go to git in its environment (`GIT_CONFIG_*`), never on its command line, and no one's git settings are read;
+- its branches and tags, through a bare mirror in `mirrors/`: fetched from GitHub (the mirror pruned of what GitHub
+  has not, GitHub's pull requests' heads with them) and pushed to the Forgejo, which loses nothing GitHub loses. A
+  branch or a tag GitHub has no more stays on the Forgejo `ACCORDWIMSY_GRACE_DAYS` (7) from the pass that first sees
+  it gone, said then on stderr with the day it goes, and is deleted after that; back on GitHub before, it just stays.
+  A branch GitHub rewrote (a force-push: its new tip does not hold the old one), or a tag moved, keeps its old tip on
+  the Forgejo as the branch `accordwimsy/kept/branch/<name>/<YYYYMMDD-HHMMSS>` (`.../tag/...` for a tag), said, for
+  the same grace. No `--prune` push: over HTTP it deleted the `accordwimsy/pull/<n>` branches too, whatever negative
+  refspec left them out, and the Forgejo closed their pull requests (2026-10-28). The tokens go to git in its
+  environment (`GIT_CONFIG_*`), never on its command line, and no one's git settings are read;
 - its labels, made or edited as GitHub has them;
 - its issues and pull requests by their numbers, which the Forgejo then gives the same: a number GitHub has no more
   (deleted, moved to another repository) becomes a closed issue saying so, and a number the Forgejo gives otherwise
@@ -34,22 +39,30 @@ port. A pass, `accordwimsy sync [ENV FILE]`, for each repository of the organiza
   branch, from its head, which GitHub keeps for every one, a fork's too (`refs/pull/<n>/head`): pushed to the Forgejo
   as the branch `accordwimsy/pull/<n>` while it is open, moved when GitHub's moves. One merged on GitHub is marked
   merged by GitHub's merge commit (the repository allows a commit to mark it, `allow_manual_merge`), one closed is
-  closed, one reopened is reopened; once it is not open its branch goes, the pull request keeps its commits. A merge
+  closed, one reopened is reopened; once it is not open its branch goes, the pull request keeps its commits. One left
+  open that the Forgejo closed under the sync gets its head back and is reopened on the next pass. A merge
   commit the branch here does not hold (pushed over since) leaves it closed, said. Only one whose head or base branch
   GitHub has no more is an issue, saying why, its branches (`fork:branch` into `main`), its state and where its
   changes are. Each starts with its GitHub author, day and link; an edit on GitHub (its `updated_at`: title, text,
   state, labels) edits it;
 - the comments, each with its GitHub author, day and link; one edited on GitHub is edited. One deleted there stays.
 
+An issue, a comment or a repository is never deleted on the Forgejo. A repository GitHub lists no more (deleted, moved,
+or out of the token's reach) is said once on stderr and left as it is.
+
 Not mirrored: milestones (the organization has none, 2026-10-28), a comment's deletion, a release, a pull request's
 reviews and its comments on lines of its changes.
 
 A pass asks only for what changed since the last one (GitHub's `since`), keeps in `state.json` what it made (the next
 number, each issue's and comment's `updated_at`, the Forgejo's id of each comment, the state each pull request was
-left in), and writes it after each
+left in, what waits out the grace and since when, when its last pass went through, since when GitHub lists it no
+more), and writes it after each
 repository: a pass that stops goes on from there. One pass at a time: a second one, while one goes, says so and does
 nothing. What it did goes to stdout, what went wrong to stderr, which cron mails; the exit status is 1 when a
-repository stopped.
+repository stopped. After each pass it writes `ACCORDWIMSY_FRESH`, a line per repository GitHub lists, `<name>
+<seconds since the epoch of its last good pass>` (0: none yet), for the host to tell a copy that lags (noirjail.sh's
+`jail fresh`). `accordwimsy status [ENV FILE]` prints each repository's last good pass, and what waits out the grace
+with the day it goes.
 
 Its settings, a line each of its env file (`deploy/accordwimsy.env.example`):
 
@@ -63,10 +76,13 @@ Its settings, a line each of its env file (`deploy/accordwimsy.env.example`):
 | `ACCORDWIMSY_FORGEJO_ORG` | `ACCORDWIMSY_ORG`'s | the Forgejo's organization |
 | `ACCORDWIMSY_STATE` | `/var/db/accordwimsy` | `state.json`, the lock and `mirrors/` |
 | `ACCORDWIMSY_GIT` | `/usr/local/bin/git` | the git it runs |
+| `ACCORDWIMSY_GRACE_DAYS` | `7` | how long a branch or a tag GitHub has no more, or a rewritten one's old tip, stays on the Forgejo |
+| `ACCORDWIMSY_FRESH` | `/var/log/accordwimsy/accordwimsy.fresh` | each repository's last good pass; made beforehand, owned by the user, in a directory only root writes, since root on the host reads it |
 | `ACCORDWIMSY_GITHUB_API`, `ACCORDWIMSY_GITHUB` | `https://api.github.com`, `https://github.com` | where GitHub is (the tests' fakes) |
 
 A key it does not know stops it, naming the key and its line; so does a value past the room it has, and a needed one
-left empty. It goes out to `github.com` and `api.github.com` on 443 and to the Forgejo, nowhere else.
+left empty, or days that are no number. It goes out to `github.com` and `api.github.com` on 443 and to the Forgejo,
+nowhere else.
 
 Build and test: `make` and `make test` in `accordwimsy/` (FreeBSD packages: `git-lite`, `curl`, `pkgconf`,
 `ca_root_nss`). The tests run a fake GitHub and a fake Forgejo (its repositories, the issues' numbers, labels,

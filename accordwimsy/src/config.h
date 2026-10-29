@@ -16,9 +16,12 @@ typedef struct {
     char github[256];        /* ACCORDWIMSY_GITHUB: where its repositories clone from */
     char state[1024];        /* ACCORDWIMSY_STATE: state.json, the lock and mirrors/ */
     char git[256];           /* ACCORDWIMSY_GIT */
+    char grace_days[16];     /* ACCORDWIMSY_GRACE_DAYS: what GitHub has no more stays on the Forgejo that long */
+    char fresh[1024];        /* ACCORDWIMSY_FRESH: each repository's last good pass, for the host to read */
+    long grace;              /* grace_days, in seconds */
 } AwConfig;
 
 /* the file at path read into c, the defaults first: 0, or nonzero with why (a key it does not know, a value too long,
-   one needed and missing) */
+   one needed and missing, days that are no number) */
 int aw_config_read(AwConfig* c, const char* path, char* why, size_t size);
 #endif
