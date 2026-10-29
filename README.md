@@ -4,6 +4,7 @@ Two bots, each a service of its own in a FreeBSD jail (Bastille), `discordbots` 
 the jail with [Concord](https://github.com/Cogmasters/concord) v3.0.1, libcurl and [cJSON](https://github.com/DaveGamble/cJSON)
 1.7.19 (`rei/third_party/cjson`); Xuji in Python 3.12 with discord.py from the jail's packages. A third, AogoWimsy,
 runs beside a Claude Code session instead: the MCP server the session starts, Python 3.12 with its standard library.
+And one that is no bot: AccordWimsy, which keeps a Forgejo the same as the GitHub organization (below).
 
 | Bot | What it does | What it reads | What it sends out |
 |---|---|---|---|
@@ -13,6 +14,65 @@ runs beside a Claude Code session instead: the MCP server the session starts, Py
 
 Anyone else mentioning Xuji gets nothing and costs nothing. No bot keeps a message or logs what was said, and none
 pings anyone.
+
+## AccordWimsy
+
+`accordwimsy/`: the repositories of a GitHub organization, the same on a Forgejo, a pass at a time (cron, every 10
+minutes), in C99 with libcurl and ReiWimsy's cJSON (`rei/third_party/cjson`). It needs no Discord and listens on no
+port. A pass, `accordwimsy sync [ENV FILE]`, for each repository of the organization, the new ones too:
+
+- the repository on the Forgejo, made in its organization when it is not there, with GitHub's name, description and
+  visibility, its default branch, and its Releases tab off (releases stay on GitHub);
+- its branches and tags, through a bare mirror in `mirrors/`: fetched from GitHub and pushed to the Forgejo, each side
+  pruned of what the other has not; `refs/pull/` stay out, they are the Forgejo's own, and so do the branches its pull
+  requests are made from (`accordwimsy/pull/<n>`, below). GitHub's pull requests' heads come into the mirror too. The
+  tokens go to git in its environment (`GIT_CONFIG_*`), never on its command line, and no one's git settings are read;
+- its labels, made or edited as GitHub has them;
+- its issues and pull requests by their numbers, which the Forgejo then gives the same: a number GitHub has no more
+  (deleted, moved to another repository) becomes a closed issue saying so, and a number the Forgejo gives otherwise
+  stops the repository, said, since its issues must start empty. A pull request is a pull request into the same
+  branch, from its head, which GitHub keeps for every one, a fork's too (`refs/pull/<n>/head`): pushed to the Forgejo
+  as the branch `accordwimsy/pull/<n>` while it is open, moved when GitHub's moves. One merged on GitHub is marked
+  merged by GitHub's merge commit (the repository allows a commit to mark it, `allow_manual_merge`), one closed is
+  closed, one reopened is reopened; once it is not open its branch goes, the pull request keeps its commits. A merge
+  commit the branch here does not hold (pushed over since) leaves it closed, said. Only one whose head or base branch
+  GitHub has no more is an issue, saying why, its branches (`fork:branch` into `main`), its state and where its
+  changes are. Each starts with its GitHub author, day and link; an edit on GitHub (its `updated_at`: title, text,
+  state, labels) edits it;
+- the comments, each with its GitHub author, day and link; one edited on GitHub is edited. One deleted there stays.
+
+Not mirrored: milestones (the organization has none, 2026-10-28), a comment's deletion, a release, a pull request's
+reviews and its comments on lines of its changes.
+
+A pass asks only for what changed since the last one (GitHub's `since`), keeps in `state.json` what it made (the next
+number, each issue's and comment's `updated_at`, the Forgejo's id of each comment, the state each pull request was
+left in), and writes it after each
+repository: a pass that stops goes on from there. One pass at a time: a second one, while one goes, says so and does
+nothing. What it did goes to stdout, what went wrong to stderr, which cron mails; the exit status is 1 when a
+repository stopped.
+
+Its settings, a line each of its env file (`deploy/accordwimsy.env.example`):
+
+| Key | Default | What it is |
+|---|---|---|
+| `ACCORDWIMSY_FORGEJO` | none: needed | the Forgejo's address, `http://host:3000`: its API under `/api/v1`, its repositories under it |
+| `ACCORDWIMSY_FORGEJO_TOKEN` | none: needed | a token of the Forgejo's: `write:repository`, `write:issue`, `write:organization`, `read:user` |
+| `ACCORDWIMSY_FORGEJO_USER` | `accordwimsy` | whose that token is, for git's push |
+| `GITHUB_TOKEN` | none: needed | a fine-grained token, read-only, of the organization: Contents, Issues, Pull requests, Metadata |
+| `ACCORDWIMSY_ORG` | `scarletnx` | the GitHub organization |
+| `ACCORDWIMSY_FORGEJO_ORG` | `ACCORDWIMSY_ORG`'s | the Forgejo's organization |
+| `ACCORDWIMSY_STATE` | `/var/db/accordwimsy` | `state.json`, the lock and `mirrors/` |
+| `ACCORDWIMSY_GIT` | `/usr/local/bin/git` | the git it runs |
+| `ACCORDWIMSY_GITHUB_API`, `ACCORDWIMSY_GITHUB` | `https://api.github.com`, `https://github.com` | where GitHub is (the tests' fakes) |
+
+A key it does not know stops it, naming the key and its line; so does a value past the room it has, and a needed one
+left empty. It goes out to `github.com` and `api.github.com` on 443 and to the Forgejo, nowhere else.
+
+Build and test: `make` and `make test` in `accordwimsy/` (FreeBSD packages: `git-lite`, `curl`, `pkgconf`,
+`ca_root_nss`). The tests run a fake GitHub and a fake Forgejo (its repositories, the issues' numbers, labels,
+comments, pull requests and what it refuses of them) and git for real on bare repositories in a temporary folder: no
+network. In its jail: the binary in `/usr/local/bin/accordwimsy`, the env file as above, and the crontab line
+`*/10 * * * * accordwimsy /usr/local/bin/accordwimsy sync`.
 
 ## ReiWimsy
 
@@ -138,7 +198,7 @@ after its application (below):
 
 ## Tests
 
-    make -C rei test && python3 xuji/test_xuji.py && python3 aogo/test_aogowimsy.py
+    make -C rei test && make -C accordwimsy test && python3 xuji/test_xuji.py && python3 aogo/test_aogowimsy.py
 
 No network and no Discord: the parsing, the gateway's events (read from their JSON: Concord decodes none of them, as
 its decoder crashed on messages of 2 to 3 KB) and the messages waiting for an answer, the replies and their edits,
@@ -148,7 +208,11 @@ stdin and stdout), its tools against a fake Discord on 127.0.0.1 (drafts approve
 person's reaction, the channels and the people it may, `from`, Discord's 429s and errors), what the gateway's events
 push to the session (who and what wakes it, the owner's reaction and reply letting a stranger through), and its gateway
 client against a fake gateway on 127.0.0.1 (identify, heartbeats and their ACKs, resume, the close codes that stop it,
-pings, messages in frames), and that lines from several threads never mix on stdout.
+pings, messages in frames), and that lines from several threads never mix on stdout. AccordWimsy's, against a fake
+GitHub and a fake Forgejo and git on bare repositories: the env file and its refusals, the first pass (repositories,
+branches and tags, labels, every number, a missing one, a pull request), a pass with nothing new (GitHub asked from
+where the last stopped, the Forgejo written to only for its Releases tab), edits and new ones (an issue, a comment, a
+branch deleted), a Forgejo whose numbers differ, and the program's lock and usage.
 
 ## Deploy (on the jail's host, as root)
 
