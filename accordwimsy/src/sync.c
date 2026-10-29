@@ -618,8 +618,8 @@ static int grace(Aw* a, const char* name, cJSON* st, const char* stale) {
 }
 /* the pull requests left open here as the Forgejo has them: one it closed under the sync gets its head pushed again
    and is reopened, GitHub's state coming on with its next edit, and one it merged is recorded so; one still open whose
-   AW_PULL_BRANCH is gone (pulls: the ones the Forgejo has, NULL when not known) gets it pushed again. A --prune push
-   deleted those branches, 2026-10-28. 0, or 1 (said) */
+   AW_PULL_BRANCH is gone (pulls: the ones the Forgejo has, NULL when not known) gets it pushed again: whatever
+   deletes the branch (by hand, a push), the pull request here keeps its head. 0, or 1 (said) */
 static int keep_open(Aw* a, const char* name, cJSON* st, const char* pulls_here) {
     cJSON *pulls = child(st, "pulls"), *p, *open, *q;
     char *path, *to;
