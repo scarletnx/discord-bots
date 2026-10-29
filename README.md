@@ -40,7 +40,8 @@ port. A pass, `accordwimsy sync [ENV FILE]`, for each repository of the organiza
   as the branch `accordwimsy/pull/<n>` while it is open, moved when GitHub's moves. One merged on GitHub is marked
   merged by GitHub's merge commit (the repository allows a commit to mark it, `allow_manual_merge`), one closed is
   closed, one reopened is reopened; once it is not open its branch goes, the pull request keeps its commits. One left
-  open that the Forgejo closed under the sync gets its head back and is reopened on the next pass. A merge
+  open that the Forgejo closed under the sync gets its head back and is reopened on the next pass, and one still
+  open whose branch is gone gets the branch back. A merge
   commit the branch here does not hold (pushed over since) leaves it closed, said. Only one whose head or base branch
   GitHub has no more is an issue, saying why, its branches (`fork:branch` into `main`), its state and where its
   changes are. Each starts with its GitHub author, day and link; an edit on GitHub (its `updated_at`: title, text,

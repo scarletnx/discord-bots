@@ -15,9 +15,10 @@
    not), its pull requests' heads as refs/pull/<n>/head, and the branches and tags pushed to to, which loses nothing:
    a rewritten branch's (or a moved tag's) old tip is kept there as AW_KEPT_BRANCH/.../<stamp>, said, and nothing is
    deleted. *stale (owned): what to has under refs/heads and refs/tags that from has not, a ref a line (never an
-   AW_PULL_BRANCH one), for aw_delete_refs once it has been gone long enough. The tokens go in git's environment,
-   never its arguments. 0, or git's status, said */
-int aw_mirror(const AwConfig* c, const char* name, const char* from, const char* to, const char* stamp, char** stale);
+   AW_PULL_BRANCH one), for aw_delete_refs once it has been gone long enough; *pull_branches (owned): the AW_PULL_BRANCH
+   branches to has, a ref a line. The tokens go in git's environment, never its arguments. 0, or git's status, said */
+int aw_mirror(const AwConfig* c, const char* name, const char* from, const char* to, const char* stamp, char** stale,
+              char** pull_branches);
 /* refs (a ref a line) deleted from to: 0, or git's status, said */
 int aw_delete_refs(const AwConfig* c, const char* name, const char* to, const char* refs);
 /* 1 when the mirror of name has the branch */

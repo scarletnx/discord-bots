@@ -616,13 +616,14 @@ static int grace(Aw* a, const char* name, cJSON* st, const char* stale) {
     buf_free(&due);
     return rc;
 }
-/* the pull requests left open here that the Forgejo has closed under the sync (their branch deleted: a --prune push did,
-   2026-10-28): each one's head pushed again and the pull request reopened, GitHub's state coming on with its next
-   edit; one the Forgejo has merged is recorded so. 0, or 1 (said) */
-static int keep_open(Aw* a, const char* name, cJSON* st) {
+/* the pull requests left open here as the Forgejo has them: one it closed under the sync gets its head pushed again
+   and is reopened, GitHub's state coming on with its next edit, and one it merged is recorded so; one still open whose
+   AW_PULL_BRANCH is gone (pulls: the ones the Forgejo has, NULL when not known) gets it pushed again. A --prune push
+   deleted those branches, 2026-10-28. 0, or 1 (said) */
+static int keep_open(Aw* a, const char* name, cJSON* st, const char* pulls_here) {
     cJSON *pulls = child(st, "pulls"), *p, *open, *q;
     char *path, *to;
-    int rc = 0, *lost, nlost = 0, i;
+    int rc = 0, *lost, nlost = 0, *bare, nbare = 0, i;
     for (p = pulls->child; p && !(cJSON_IsString(p) && !strcmp(p->valuestring, "open")); p = p->next) continue;
     if (!p) return 0;
     path = aw_format("repos/%s/%s/pulls?state=open", a->config->forgejo_org, name);
@@ -630,13 +631,24 @@ static int keep_open(Aw* a, const char* name, cJSON* st) {
     free(path);
     if (!open) return 1;
     lost = calloc((size_t)cJSON_GetArraySize(pulls) + 1, sizeof *lost);
+    bare = calloc((size_t)cJSON_GetArraySize(pulls) + 1, sizeof *bare);
     for (p = pulls->child; p; p = p->next) {
         int number = atoi(p->string), here = 0;
+        char* branch;
         if (!cJSON_IsString(p) || strcmp(p->valuestring, "open")) continue;
         for (q = open->child; q && !here; q = q->next) here = (int)jnum(q, "number") == number;
-        if (!here) lost[nlost++] = number;
+        branch = aw_format("refs/heads/" AW_PULL_BRANCH, number);
+        if (!here)
+            lost[nlost++] = number;
+        else if (pulls_here && !has_line(pulls_here, branch))
+            bare[nbare++] = number;
+        free(branch);
     }
     to = forgejo_git(a, name);
+    for (i = 0; i < nbare && !rc; ++i) {
+        aw_log("%s: #%d, open, had its branch gone here: pushed again", name, bare[i]);
+        rc = aw_push_pull(a->config, name, to, bare[i]);
+    }
     for (i = 0; i < nlost && !rc; ++i) {
         char key[16], *at = aw_format("repos/%s/%s/pulls/%d", a->config->forgejo_org, name, lost[i]);
         cJSON* got = forgejo(a, "GET", at, NULL, 200, NULL);
@@ -653,6 +665,7 @@ static int keep_open(Aw* a, const char* name, cJSON* st) {
         free(at);
     }
     free(to);
+    free(bare);
     free(lost);
     cJSON_Delete(open);
     return rc;
@@ -767,7 +780,7 @@ static int comments(Aw* a, const char* name, cJSON* st) {
 /* ---- a pass ---- */
 static int one(Aw* a, const cJSON* repo, cJSON* repos) {
     const char* name = jstr(repo, "name");
-    char *from = github_git(a, name), *to = forgejo_git(a, name), *stale = NULL, stamp[32];
+    char *from = github_git(a, name), *to = forgejo_git(a, name), *stale = NULL, *pulls = NULL, stamp[32];
     cJSON *st = child(repos, name), *ids = cJSON_CreateObject();
     int rc;
     if (cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(st, "missing"))) {
@@ -775,13 +788,14 @@ static int one(Aw* a, const cJSON* repo, cJSON* repos) {
         cJSON_DeleteItemFromObjectCaseSensitive(st, "missing");
     }
     when_of(a->now, "%Y%m%d-%H%M%S", stamp, sizeof stamp);
-    rc = ensure_repo(a, repo) || aw_mirror(a->config, name, from, to, stamp, &stale) || patch_repo(a, repo) ||
-         labels(a, name, ids) || grace(a, name, st, stale) || keep_open(a, name, st) || issues(a, name, st, ids) ||
-         comments(a, name, st);
+    rc = ensure_repo(a, repo) || aw_mirror(a->config, name, from, to, stamp, &stale, &pulls) ||
+         patch_repo(a, repo) || labels(a, name, ids) || grace(a, name, st, stale) || keep_open(a, name, st, pulls) ||
+         issues(a, name, st, ids) || comments(a, name, st);
     if (!rc) set_number(st, "ok", a->now);
     save(a);
     cJSON_Delete(ids);
     free(stale);
+    free(pulls);
     free(from);
     free(to);
     return rc;

@@ -120,9 +120,10 @@ static int rewritten(const AwConfig* c, const char* name, char* git_dir, char* f
    branches too, whatever negative refspec left them out, and the Forgejo closed their pull requests, git.scarletnx.dev
    2026-10-28). A branch whose new tip does not hold the old one, or a tag moved, keeps its old tip there as
    AW_KEPT_BRANCH, said. *stale: what to has under refs/heads and refs/tags that the mirror has not, a ref a line (an
-   AW_KEPT_BRANCH one too; never an AW_PULL_BRANCH one). 0, or git's status, said */
+   AW_KEPT_BRANCH one too; never an AW_PULL_BRANCH one); *pulls: the AW_PULL_BRANCH ones to has, a ref a line. 0, or
+   git's status, said */
 static int push_mirror(const AwConfig* c, const char* name, char* git_dir, const char* to, const char* stamp,
-                       const char* before, char** stale) {
+                       const char* before, char** stale, char** pulls) {
     char heads[] = "+refs/heads/*:refs/heads/*", tags[] = "+refs/tags/*:refs/tags/*", quiet[] = "--quiet",
          verb[] = "push", list[] = "ls-remote", h[] = "--heads", t[] = "--tags";
     char* ls[] = {"git", list, h, t, (char*)to, NULL};
@@ -130,7 +131,7 @@ static int push_mirror(const AwConfig* c, const char* name, char* git_dir, const
     const char *line, *end;
     size_t n = 0, lines = 0, i;
     int r = 0;
-    Buf out = {0};
+    Buf out = {0}, ours = {0};
     if (!after) {
         aw_warn("%s: the mirror's refs could not be listed", name);
         return 1;
@@ -149,8 +150,8 @@ static int push_mirror(const AwConfig* c, const char* name, char* git_dir, const
         if (object_of(after, ref, ' ', object) && strcmp(was, object) &&
             (!strncmp(ref, "refs/tags/", 10) || rewritten(c, name, git_dir, was, object))) {
             int tag = !strncmp(ref, "refs/tags/", 10);
-            char* kept =
-                aw_format("refs/heads/" AW_KEPT_BRANCH "/%s/%s/%s", tag ? "tag" : "branch", ref + (tag ? 10 : 11), stamp);
+            const char* kind = tag ? "tag" : "branch";
+            char* kept = aw_format("refs/heads/" AW_KEPT_BRANCH "/%s/%s/%s", kind, ref + (tag ? 10 : 11), stamp);
             aw_warn("%s: %s was rewritten on GitHub: its old tip %.12s is kept here as %s", name, ref, was, kept + 11);
             push[n++] = aw_format("%s:%s", was, kept);
             free(kept);
@@ -170,27 +171,31 @@ static int push_mirror(const AwConfig* c, const char* name, char* git_dir, const
             end = strchr(line, '\n') ? strchr(line, '\n') : line + strlen(line);
             if (!tab || tab > end) continue;
             ref = aw_format("%.*s", (int)(end - tab - 1), tab + 1);
-            if ((!strncmp(ref, "refs/heads/", 11) || !strncmp(ref, "refs/tags/", 10)) &&
-                strncmp(ref, "refs/heads/accordwimsy/pull/", 28) && !strstr(ref, "^{}") &&
-                !object_of(after, ref, ' ', object))
+            if (!strncmp(ref, "refs/heads/accordwimsy/pull/", 28))
+                buf_printf(&ours, "%s\n", ref);
+            else if ((!strncmp(ref, "refs/heads/", 11) || !strncmp(ref, "refs/tags/", 10)) && !strstr(ref, "^{}") &&
+                     !object_of(after, ref, ' ', object))
                 buf_printf(&out, "%s\n", ref);
             free(ref);
         }
     *stale = r ? NULL : buf_take(&out);
+    *pulls = r ? NULL : buf_take(&ours);
     buf_free(&out);
+    buf_free(&ours);
     for (i = 7; i < n; ++i) free(push[i]);
     free(push);
     free(theirs);
     free(after);
     return r;
 }
-int aw_mirror(const AwConfig* c, const char* name, const char* from, const char* to, const char* stamp, char** stale) {
+int aw_mirror(const AwConfig* c, const char* name, const char* from, const char* to, const char* stamp, char** stale,
+              char** pull_branches) {
     char *dir = mirror_of(c, name), *git_dir = aw_format("--git-dir=%s", dir), *before = NULL;
     char heads[] = "+refs/heads/*:refs/heads/*", tags[] = "+refs/tags/*:refs/tags/*",
          pulls[] = "+refs/pull/*/head:refs/pull/*/head", no_gc[] = "-c", gc_off[] = "gc.auto=0";
     struct stat st;
     int r = 0;
-    *stale = NULL;
+    *stale = *pull_branches = NULL;
     if (stat(dir, &st)) {
         char* init[] = {"git", "init", "--bare", "--quiet", dir, NULL};
         r = git(c, init, 1);
@@ -212,8 +217,9 @@ int aw_mirror(const AwConfig* c, const char* name, const char* from, const char*
         if (git(c, any, 1)) { /* a repository with no commit yet: git pushes nothing, and says so as a failure */
             aw_log("%s: no branch or tag on GitHub yet, nothing to push", name);
             *stale = aw_strdup("");
+            *pull_branches = aw_strdup("");
         } else
-            r = push_mirror(c, name, git_dir, to, stamp, before, stale);
+            r = push_mirror(c, name, git_dir, to, stamp, before, stale, pull_branches);
         if (!r && git(c, gc, 1)) aw_warn("%s: git gc --auto in the mirror failed", name);
     }
     free(before);

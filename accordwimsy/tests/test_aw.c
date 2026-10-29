@@ -804,9 +804,10 @@ int main(void) {
     }
     CHECK(pull_state_of(state, "7") && !strcmp(pull_state_of(state, "7"), "open"));
 
-    /* the Forgejo closes #7 under the sync, its branch deleted, as a --prune push over HTTP did (2026-10-28): the next
-       pass, nothing new on GitHub, pushes its head again and reopens it */
+    /* the Forgejo closes #7 under the sync, its branch deleted, as a --prune push over HTTP did (2026-10-28), and #6
+       stays open with its branch gone: the next pass, nothing new on GitHub, pushes both heads again and reopens #7 */
     CHECK(!quiet("git --git-dir=%s/fj/org/game.git update-ref -d refs/heads/accordwimsy/pull/7", root));
+    CHECK(!quiet("git --git-dir=%s/fj/org/game.git update-ref -d refs/heads/accordwimsy/pull/6", root));
     if (game && game->nissues == 10) {
         free(game->issues[6].state);
         game->issues[6].state = aw_strdup("closed");
@@ -815,6 +816,13 @@ int main(void) {
     CHECK(pass(&c, state, NULL) == 0);
     CHECK(game && game->nissues == 10 && !strcmp(game->issues[6].state, "open") &&
           has_branch(game, "accordwimsy/pull/7"));
+    {
+        char *theirs = rev("gh", "game", "refs/pull/6/head"),
+             *ours = rev("fj", "game", "refs/heads/accordwimsy/pull/6");
+        CHECK(game && !strcmp(game->issues[5].state, "open") && theirs[0] && !strcmp(theirs, ours));
+        free(theirs);
+        free(ours);
+    }
 
     /* #6 pushed to and retitled, #7 closed again: the branch moved, the title too; #7's branch gone */
     CHECK(!sh("cd %s/work && git switch --quiet faster && git commit --quiet --allow-empty -m 'faster, again' && "
