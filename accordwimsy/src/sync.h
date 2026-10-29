@@ -23,6 +23,7 @@ typedef struct {
     long writes;   /* the Forgejo's POST, PATCH and PUT, for the log */
     int failures;  /* repositories a pass stopped on */
     long now;      /* the pass's time, seconds since the epoch */
+    int numbers_off; /* a number the Forgejo gave was not GitHub's, this repository */
     char* state_path;
 } Aw;
 
