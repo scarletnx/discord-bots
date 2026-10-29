@@ -9,10 +9,10 @@
    request's head in its own repository (refs/pull/<number>/head), a fork's too */
 #define AW_PULL_BRANCH "accordwimsy/pull/%d"
 
-/* mirrors/<name>.git made when there is none, then from's branches and tags fetched into it and pushed to to, each
-   side pruned of what the other has not (never refs/pull/: the Forgejo's own; nor the AW_PULL_BRANCH ones, which the
-   pull requests take care of), and from's pull requests' heads fetched as refs/pull/<n>/head. The tokens go in git's
-   environment, never its arguments. 0, or git's status, said */
+/* mirrors/<name>.git made when there is none, then from's branches and tags fetched into it (pruned of what from has
+   not) and pushed to to, where each one the mirror has not is deleted by its name (never refs/pull/: the Forgejo's
+   own; nor the AW_PULL_BRANCH ones, which the pull requests take care of); from's pull requests' heads fetched as
+   refs/pull/<n>/head. The tokens go in git's environment, never its arguments. 0, or git's status, said */
 int aw_mirror(const AwConfig* c, const char* name, const char* from, const char* to);
 /* 1 when the mirror of name has the branch */
 int aw_has_branch(const AwConfig* c, const char* name, const char* branch);

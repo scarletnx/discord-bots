@@ -544,6 +544,47 @@ static int update(Aw* a, const char* name, int number, const cJSON* issue, const
         return update_pull(a, name, number, issue, ids, child(st, "pulls"));
     return update_issue(a, name, number, issue, ids);
 }
+/* the pull requests left open here that the Forgejo has closed under the sync (their branch deleted: a --prune push did,
+   2026-10-28): each one's head pushed again and the pull request reopened, GitHub's state coming on with its next
+   edit; one the Forgejo has merged is recorded so. 0, or 1 (said) */
+static int keep_open(Aw* a, const char* name, cJSON* st) {
+    cJSON *pulls = child(st, "pulls"), *p, *open, *q;
+    char *path, *to;
+    int rc = 0, *lost, nlost = 0, i;
+    for (p = pulls->child; p && !(cJSON_IsString(p) && !strcmp(p->valuestring, "open")); p = p->next) continue;
+    if (!p) return 0;
+    path = aw_format("repos/%s/%s/pulls?state=open", a->config->forgejo_org, name);
+    open = forgejo_all(a, path);
+    free(path);
+    if (!open) return 1;
+    lost = calloc((size_t)cJSON_GetArraySize(pulls) + 1, sizeof *lost);
+    for (p = pulls->child; p; p = p->next) {
+        int number = atoi(p->string), here = 0;
+        if (!cJSON_IsString(p) || strcmp(p->valuestring, "open")) continue;
+        for (q = open->child; q && !here; q = q->next) here = (int)jnum(q, "number") == number;
+        if (!here) lost[nlost++] = number;
+    }
+    to = forgejo_git(a, name);
+    for (i = 0; i < nlost && !rc; ++i) {
+        char key[16], *at = aw_format("repos/%s/%s/pulls/%d", a->config->forgejo_org, name, lost[i]);
+        cJSON* got = forgejo(a, "GET", at, NULL, 200, NULL);
+        snprintf(key, sizeof key, "%d", lost[i]);
+        rc = !got;
+        if (got && jbool(got, "merged")) {
+            aw_log("%s: #%d, left open here, is merged here: recorded so", name, lost[i]);
+            set_string(pulls, key, "merged");
+        } else if (got) {
+            aw_log("%s: #%d, left open here, was closed under the sync: its head pushed again, reopened", name, lost[i]);
+            rc = aw_push_pull(a->config, name, to, lost[i]) || set_state(a, name, lost[i], 0);
+        }
+        cJSON_Delete(got);
+        free(at);
+    }
+    free(to);
+    free(lost);
+    cJSON_Delete(open);
+    return rc;
+}
 static int by_number(const void* x, const void* y) {
     double a = jnum(*(cJSON* const*)x, "number"), b = jnum(*(cJSON* const*)y, "number");
     return a < b ? -1 : a > b;
@@ -657,7 +698,7 @@ static int one(Aw* a, const cJSON* repo, cJSON* repos) {
     char *from = github_git(a, name), *to = forgejo_git(a, name);
     cJSON *st = child(repos, name), *ids = cJSON_CreateObject();
     int rc = ensure_repo(a, repo) || aw_mirror(a->config, name, from, to) || patch_repo(a, repo) ||
-             labels(a, name, ids) || issues(a, name, st, ids) || comments(a, name, st);
+             labels(a, name, ids) || keep_open(a, name, st) || issues(a, name, st, ids) || comments(a, name, st);
     save(a);
     cJSON_Delete(ids);
     free(from);
