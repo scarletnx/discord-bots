@@ -23,6 +23,8 @@ static const Key keys[] = {
     {"ACCORDWIMSY_GITHUB", ROOM(github), "https://github.com"},
     {"ACCORDWIMSY_STATE", ROOM(state), "/var/db/accordwimsy"},
     {"ACCORDWIMSY_GIT", ROOM(git), "/usr/local/bin/git"},
+    {"ACCORDWIMSY_GRACE_DAYS", ROOM(grace_days), "7"},
+    {"ACCORDWIMSY_FRESH", ROOM(fresh), "/var/log/accordwimsy/accordwimsy.fresh"},
 };
 #define KEYS (sizeof keys / sizeof *keys)
 
@@ -81,5 +83,10 @@ int aw_config_read(AwConfig* c, const char* path, char* why, size_t size) {
             snprintf(why, size, "%s: %s is needed, and empty", path, keys[i].key);
             return 1;
         }
+    if (strspn(c->grace_days, "0123456789") != strlen(c->grace_days) || strlen(c->grace_days) > 4) {
+        snprintf(why, size, "%s: ACCORDWIMSY_GRACE_DAYS is \"%s\", no number of days (0 to 9999)", path, c->grace_days);
+        return 1;
+    }
+    c->grace = atol(c->grace_days) * 86400L;
     return 0;
 }

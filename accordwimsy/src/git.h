@@ -8,12 +8,19 @@
 /* The Forgejo's branch of GitHub's pull request number, which its pull request is made from: GitHub keeps every pull
    request's head in its own repository (refs/pull/<number>/head), a fork's too */
 #define AW_PULL_BRANCH "accordwimsy/pull/%d"
+/* Where the Forgejo keeps the old tip of a branch (or a tag) GitHub rewrote: AW_KEPT_BRANCH/branch/<name>/<stamp> */
+#define AW_KEPT_BRANCH "accordwimsy/kept"
 
-/* mirrors/<name>.git made when there is none, then from's branches and tags fetched into it and pushed to to, each
-   side pruned of what the other has not (never refs/pull/: the Forgejo's own; nor the AW_PULL_BRANCH ones, which the
-   pull requests take care of), and from's pull requests' heads fetched as refs/pull/<n>/head. The tokens go in git's
-   environment, never its arguments. 0, or git's status, said */
-int aw_mirror(const AwConfig* c, const char* name, const char* from, const char* to);
+/* mirrors/<name>.git made when there is none, then from's branches and tags fetched into it (pruned of what from has
+   not), its pull requests' heads as refs/pull/<n>/head, and the branches and tags pushed to to, which loses nothing:
+   a rewritten branch's (or a moved tag's) old tip is kept there as AW_KEPT_BRANCH/.../<stamp>, said, and nothing is
+   deleted. *stale (owned): what to has under refs/heads and refs/tags that from has not, a ref a line (never an
+   AW_PULL_BRANCH one), for aw_delete_refs once it has been gone long enough; *pull_branches (owned): the AW_PULL_BRANCH
+   branches to has, a ref a line. The tokens go in git's environment, never its arguments. 0, or git's status, said */
+int aw_mirror(const AwConfig* c, const char* name, const char* from, const char* to, const char* stamp, char** stale,
+              char** pull_branches);
+/* refs (a ref a line) deleted from to: 0, or git's status, said */
+int aw_delete_refs(const AwConfig* c, const char* name, const char* to, const char* refs);
 /* 1 when the mirror of name has the branch */
 int aw_has_branch(const AwConfig* c, const char* name, const char* branch);
 /* 1 when the mirror of name has GitHub's pull request number's head */
