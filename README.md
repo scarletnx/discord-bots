@@ -29,8 +29,9 @@ port. A pass, `accordwimsy sync [ENV FILE]`, for each repository of the organiza
   it gone, said then on stderr with the day it goes, and is deleted after that; back on GitHub before, it just stays.
   A branch GitHub rewrote (a force-push: its new tip does not hold the old one), or a tag moved, keeps its old tip on
   the Forgejo as the branch `accordwimsy/kept/branch/<name>/<YYYYMMDD-HHMMSS>` (`.../tag/...` for a tag), said, for
-  the same grace. No `--prune` push: over HTTP it deleted the `accordwimsy/pull/<n>` branches too, whatever negative
-  refspec left them out, and the Forgejo closed their pull requests (2026-10-28). The tokens go to git in its
+  the same grace. No `--prune` push: over HTTP, with the negative refspec that kept the `accordwimsy/pull/<n>`
+  branches out of it, git warned `helper reported unexpected status` for each of them on every pass (2026-10-28;
+  they stayed). The tokens go to git in its
   environment (`GIT_CONFIG_*`), never on its command line, and no one's git settings are read;
 - its labels, made or edited as GitHub has them;
 - its issues and pull requests by their numbers, which the Forgejo then gives the same: a number GitHub has no more

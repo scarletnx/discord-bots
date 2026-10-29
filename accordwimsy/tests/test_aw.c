@@ -804,8 +804,8 @@ int main(void) {
     }
     CHECK(pull_state_of(state, "7") && !strcmp(pull_state_of(state, "7"), "open"));
 
-    /* the Forgejo closes #7 under the sync, its branch deleted, as a --prune push over HTTP did (2026-10-28), and #6
-       stays open with its branch gone: the next pass, nothing new on GitHub, pushes both heads again and reopens #7 */
+    /* the Forgejo closes #7 under the sync, its branch deleted, and #6 stays open with its branch gone: the next
+       pass, nothing new on GitHub, pushes both heads again and reopens #7 */
     CHECK(!quiet("git --git-dir=%s/fj/org/game.git update-ref -d refs/heads/accordwimsy/pull/7", root));
     CHECK(!quiet("git --git-dir=%s/fj/org/game.git update-ref -d refs/heads/accordwimsy/pull/6", root));
     if (game && game->nissues == 10) {

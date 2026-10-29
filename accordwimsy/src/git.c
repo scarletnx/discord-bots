@@ -116,9 +116,9 @@ static int rewritten(const AwConfig* c, const char* name, char* git_dir, char* f
     if (r > 1) aw_warn("%s: git merge-base %.12s %.12s: status %d, taken as rewritten", name, from, to, r);
     return r != 0;
 }
-/* the mirror's branches and tags pushed to to, never deleting (no --prune: over HTTP it deleted the AW_PULL_BRANCH
-   branches too, whatever negative refspec left them out, and the Forgejo closed their pull requests, git.scarletnx.dev
-   2026-10-28). A branch whose new tip does not hold the old one, or a tag moved, keeps its old tip there as
+/* the mirror's branches and tags pushed to to, never deleting (no --prune: over HTTP, with the negative refspec that
+   kept the AW_PULL_BRANCH branches out of it, git warned "helper reported unexpected status" for each of them on every
+   pass, git.scarletnx.dev 2026-10-28; they stayed). A branch whose new tip does not hold the old one, or a tag moved, keeps its old tip there as
    AW_KEPT_BRANCH, said. *stale: what to has under refs/heads and refs/tags that the mirror has not, a ref a line (an
    AW_KEPT_BRANCH one too; never an AW_PULL_BRANCH one); *pulls: the AW_PULL_BRANCH ones to has, a ref a line. 0, or
    git's status, said */
