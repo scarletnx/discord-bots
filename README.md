@@ -26,10 +26,10 @@ port. A pass, `accordwimsy sync [ENV FILE]`, for each repository of the organiza
 - its branches and tags, through a bare mirror in `mirrors/`: fetched from GitHub (the mirror pruned of what GitHub
   has not, GitHub's pull requests' heads with them) and pushed to the Forgejo, which loses nothing GitHub loses. A
   branch or a tag GitHub has no more stays on the Forgejo `ACCORDWIMSY_GRACE_DAYS` (7) from the pass that first sees
-  it gone, said then on stderr with the day it goes, and is deleted after that; back on GitHub before, it just stays.
+  it gone, said then in its log with the day it goes, and is deleted after that; back on GitHub before, it just stays.
   A branch GitHub rewrote (a force-push: its new tip does not hold the old one), or a tag moved, keeps its old tip on
-  the Forgejo as the branch `accordwimsy/kept/branch/<name>/<YYYYMMDD-HHMMSS>` (`.../tag/...` for a tag), said, for
-  the same grace. No `--prune` push: over HTTP, with the negative refspec that kept the `accordwimsy/pull/<n>`
+  the Forgejo as the branch `accordwimsy/kept/branch/<name>/<YYYYMMDD-HHMMSS>` (`.../tag/...` for a tag), said in
+  its log, for the same grace. No `--prune` push: over HTTP, with the negative refspec that kept the `accordwimsy/pull/<n>`
   branches out of it, git warned `helper reported unexpected status` for each of them on every pass (2026-10-28;
   they stayed). The tokens go to git in its
   environment (`GIT_CONFIG_*`), never on its command line, and no one's git settings are read;
@@ -60,8 +60,14 @@ number, each issue's and comment's `updated_at`, the Forgejo's id of each commen
 left in, what waits out the grace and since when, when its last pass went through, since when GitHub lists it no
 more), and writes it after each
 repository: a pass that stops goes on from there. One pass at a time: a second one, while one goes, says so and does
-nothing. What it did goes to stdout, what went wrong to stderr, which cron mails; the exit status is 1 when a
-repository stopped. After each pass it writes `ACCORDWIMSY_FRESH`, a line per repository GitHub lists, `<name>
+nothing. What it did goes to stdout, its log, and so do a repository's pass that went wrong (an HTTP error, a push
+refused: the next pass tries again), what git itself says, and the everyday news (a branch or a tag gone from GitHub,
+a branch rewritten, a pull request closed rather than merged). stderr, which the host mails (`jail logmail`), holds
+only what someone has to see: the default branch gone from GitHub or rewritten, half or more of a repository's
+branches and tags gone in one pass (3 at least), a repository GitHub lists no more, the Forgejo's issue numbers no
+longer GitHub's (once, until that repository passes again), a `state.json` or `ACCORDWIMSY_FRESH` it cannot write,
+and what keeps a pass from starting. A repository that keeps failing shows in its last good pass, which `jail fresh`
+mails about once it lags. The exit status is 1 when a repository stopped. After each pass it writes `ACCORDWIMSY_FRESH`, a line per repository GitHub lists, `<name>
 <seconds since the epoch of its last good pass>` (0: none yet), for the host to tell a copy that lags (noirjail.sh's
 `jail fresh`). `accordwimsy status [ENV FILE]` prints each repository's last good pass, and what waits out the grace
 with the day it goes.

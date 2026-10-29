@@ -495,6 +495,23 @@ static int pass(AwConfig* c, cJSON* state, long* written) {
     free(a.state_path);
     return rc;
 }
+/* a pass as pass() runs it, what it said on standard error into *err (owned): what cron mails */
+static int pass_err(AwConfig* c, cJSON* state, char** err) {
+    char* path = aw_format("%s/stderr", root);
+    int saved, fd, rc;
+    fflush(stderr);
+    saved = dup(2);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    dup2(fd, 2);
+    close(fd);
+    rc = pass(c, state, NULL);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    *err = slurp(path);
+    free(path);
+    return rc;
+}
 static int writes_total(void) { return writes[0] + writes[1] + writes[2] + writes[3]; }
 
 int main(void) {
@@ -660,7 +677,21 @@ int main(void) {
            "\"created_at\":\"2026-10-06T12:00:00Z\",\"updated_at\":\"2026-10-06T12:00:00Z\"}]");
     CHECK(!sh("git --git-dir=%s/gh/org/game.git branch --quiet -D feature", root));
     CHECK(!sh("git --git-dir=%s/gh/org/game.git update-ref -d refs/tags/old", root));
-    CHECK(pass(&c, state, NULL) == 0);
+    {
+        /* a branch and a tag gone on GitHub are the log's, not standard error's (cron mails it); so is what git says
+           on its own standard error, as the Forgejo's hint after each push was (a git that says it every time) */
+        char *err, *chatty = aw_format("%s/chatty-git", root);
+        FILE* f = fopen(chatty, "w");
+        fprintf(f, "#!/bin/sh\ngit \"$@\"; s=$?\necho \"remote: Create a new pull request for 'x':\" >&2\nexit $s\n");
+        fclose(f);
+        chmod(chatty, 0755);
+        snprintf(c.git, sizeof c.git, "%s", chatty);
+        CHECK(pass_err(&c, state, &err) == 0);
+        CHECK(!strcmp(err, ""));
+        snprintf(c.git, sizeof c.git, "git");
+        free(err);
+        free(chatty);
+    }
     if (game && game->nissues == 5) {
         CHECK(!strcmp(game->issues[0].title, "Sound is off on the title screen") &&
               !strcmp(game->issues[0].state, "closed") && game->issues[0].nlabels == 0);
@@ -690,7 +721,12 @@ int main(void) {
                   "git commit --quiet --allow-empty -m other && git push --quiet --force origin other:topic && "
                   "git switch --quiet main",
                   root));
-        CHECK(pass(&c, state, NULL) == 0);
+        {
+            char* err; /* a branch of a pull request rewritten is the log's too */
+            CHECK(pass_err(&c, state, &err) == 0);
+            CHECK(!strcmp(err, ""));
+            free(err);
+        }
         CHECK(!cJSON_GetObjectItemCaseSensitive(gone_of(state), "refs/tags/old") &&
               jnum(gone_of(state), "refs/heads/feature") == now_t - 3 * 86400 && jnum(gone_of(state), at) == now_t);
         ours = rev("fj", "game", "refs/heads/topic");
@@ -705,7 +741,12 @@ int main(void) {
         free(ours);
         /* 10 days after feature went: deleted here, and the kept tip, 7 days old, too */
         now_t += 7 * 86400;
-        CHECK(pass(&c, state, NULL) == 0);
+        {
+            char* err; /* and their deletion once the grace is over */
+            CHECK(pass_err(&c, state, &err) == 0);
+            CHECK(!strcmp(err, ""));
+            free(err);
+        }
         CHECK(game && !has_branch(game, "feature") && !has_branch(game, kept) && has_branch(game, "topic"));
         CHECK(gone_of(state) && !gone_of(state)->child);
         free(theirs);
@@ -883,7 +924,10 @@ int main(void) {
         github("orgs/org/repos?type=all&sort=full_name",
                "[{\"name\":\"game\",\"private\":false,\"description\":\"A game\",\"default_branch\":\"main\","
                "\"html_url\":\"https://github.com/org/game\"}]");
-        CHECK(pass(&c, state, NULL) == 0);
+        text = NULL;
+        CHECK(pass_err(&c, state, &text) == 0);
+        CHECK(strstr(text, "empty is not on GitHub any more") != NULL);
+        free(text);
         CHECK(jnum(cJSON_GetObjectItemCaseSensitive(cJSON_GetObjectItemCaseSensitive(state, "repos"), "empty"),
                    "missing") == now_t);
         text = slurp(fresh);
@@ -900,15 +944,43 @@ int main(void) {
         }
     }
 
+    {
+        /* the default branch rewritten on GitHub: for someone to see, on standard error, its old tip kept; then three
+           of its four branches and tags gone in one pass, as someone deleting everything would */
+        char* err;
+        CHECK(!sh("cd %s/work && git switch --quiet --orphan rewritten && "
+                  "git commit --quiet --allow-empty -m rewritten && git push --quiet --force origin rewritten:main && "
+                  "git switch --quiet main",
+                  root));
+        now_t += 600;
+        CHECK(pass_err(&c, state, &err) == 0);
+        CHECK(strstr(err, "game: the default branch main was rewritten on GitHub (a force-push): its old tip "));
+        free(err);
+        CHECK(!sh("git --git-dir=%s/gh/org/game.git update-ref -d refs/heads/topic && git --git-dir=%s/gh/org/game.git "
+                  "update-ref -d refs/tags/v1 && git --git-dir=%s/gh/org/game.git update-ref -d refs/tags/old",
+                  root, root, root));
+        now_t += 600;
+        CHECK(pass_err(&c, state, &err) == 0);
+        CHECK(strstr(err, "game: 3 branches and tags gone from GitHub in one pass, 1 left there: each stays here "));
+        free(err);
+    }
+
     /* a Forgejo whose next number is not GitHub's: said, the repository stopped, the state where it was */
     github("repos/org/game/issues?state=all&sort=updated&direction=asc&since=2026-10-10T01:00:00Z",
            "[{\"number\":11,\"title\":\"Eleven\",\"state\":\"open\",\"body\":\"11\","
            "\"html_url\":\"https://github.com/org/game/issues/11\",\"user\":{\"login\":\"ada\"},"
            "\"created_at\":\"2026-10-11T09:00:00Z\",\"updated_at\":\"2026-10-11T09:00:00Z\",\"labels\":[]}]");
-    skew = 1;
-    CHECK(pass(&c, state, NULL) == 1);
-    CHECK(next_of(state) == 11);
-    skew = 0;
+    {
+        char* err;
+        skew = 1;
+        CHECK(pass_err(&c, state, &err) == 1);
+        CHECK(next_of(state) == 11 && strstr(err, "game: the Forgejo's issue numbers no longer match GitHub's"));
+        free(err);
+        CHECK(pass_err(&c, state, &err) == 1); /* said once: the next pass stops there again, quietly */
+        CHECK(next_of(state) == 11 && !strcmp(err, ""));
+        free(err);
+        skew = 0;
+    }
 
     /* the program itself, while another pass holds the lock: it says so and does nothing */
     {

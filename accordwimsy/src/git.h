@@ -13,12 +13,15 @@
 
 /* mirrors/<name>.git made when there is none, then from's branches and tags fetched into it (pruned of what from has
    not), its pull requests' heads as refs/pull/<n>/head, and the branches and tags pushed to to, which loses nothing:
-   a rewritten branch's (or a moved tag's) old tip is kept there as AW_KEPT_BRANCH/.../<stamp>, said, and nothing is
+   a rewritten branch's (or a moved tag's) old tip is kept there as AW_KEPT_BRANCH/.../<stamp>, said in the log, and
+   on standard error, for someone to see, when it is main_branch's (the default branch; NULL: none); nothing is
    deleted. *stale (owned): what to has under refs/heads and refs/tags that from has not, a ref a line (never an
    AW_PULL_BRANCH one), for aw_delete_refs once it has been gone long enough; *pull_branches (owned): the AW_PULL_BRANCH
    branches to has, a ref a line. The tokens go in git's environment, never its arguments. 0, or git's status, said */
-int aw_mirror(const AwConfig* c, const char* name, const char* from, const char* to, const char* stamp, char** stale,
-              char** pull_branches);
+int aw_mirror(const AwConfig* c, const char* name, const char* from, const char* to, const char* stamp,
+              const char* main_branch, char** stale, char** pull_branches);
+/* how many branches and tags the mirror of name has (GitHub's, as of its last fetch) */
+int aw_ref_count(const AwConfig* c, const char* name);
 /* refs (a ref a line) deleted from to: 0, or git's status, said */
 int aw_delete_refs(const AwConfig* c, const char* name, const char* to, const char* refs);
 /* 1 when the mirror of name has the branch */

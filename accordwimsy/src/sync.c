@@ -20,13 +20,13 @@ static cJSON* request(Aw* a, const char* method, const char* url, const char* au
     if (strcmp(method, "GET")) a->writes++;
     *status = got.status;
     if (got.error) {
-        aw_warn("%s", got.error);
+        aw_log("%s", got.error);
         aw_answer_free(&got);
         return NULL;
     }
     json = got.body ? cJSON_Parse(got.body) : NULL;
     if (got.status >= 300 && got.status != 404)
-        aw_warn("%s %s: HTTP %d: %.200s", method, url, got.status, got.body ? got.body : "");
+        aw_log("%s %s: HTTP %d: %.200s", method, url, got.status, got.body ? got.body : "");
     aw_answer_free(&got);
     return json;
 }
@@ -54,7 +54,7 @@ static cJSON* github_all(Aw* a, const char* path) {
         int n = 0;
         free(paged);
         if (!cJSON_IsArray(got)) {
-            aw_warn("GET %s: no list came (HTTP %d)", path, status);
+            aw_log("GET %s: no list came (HTTP %d)", path, status);
             cJSON_Delete(got);
             cJSON_Delete(all);
             return NULL;
@@ -78,7 +78,7 @@ static cJSON* forgejo(Aw* a, const char* method, const char* path, const cJSON* 
     if (got != want) {
         if (got == 404 && status) { /* asked for: the caller looks at it */
         } else if (got && got < 300)
-            aw_warn("%s %s: HTTP %d where %d was due", method, path, got, want);
+            aw_log("%s %s: HTTP %d where %d was due", method, path, got, want);
         cJSON_Delete(json);
         return NULL;
     }
@@ -273,9 +273,10 @@ static int set_state(Aw* a, const char* name, int number, int closed) {
     return !got;
 }
 /* the Forgejo's number, made: it must come back as GitHub's, else the repository stops here */
-static int same_number(const char* name, int number, const cJSON* got) {
+static int same_number(Aw* a, const char* name, int number, const cJSON* got) {
     if ((int)jnum(got, "number") == number) return 1;
-    aw_warn("%s: GitHub #%d came out as the Forgejo's #%.0f: the numbers no longer match, %s stops here (the "
+    a->numbers_off = 1;
+    aw_log("%s: GitHub #%d came out as the Forgejo's #%.0f: the numbers no longer match, %s stops here (the "
             "Forgejo's issues must start empty)",
             name, number, jnum(got, "number"), name);
     return 0;
@@ -296,7 +297,7 @@ static int create_issue(Aw* a, const char* name, int number, const cJSON* issue,
     cJSON_AddBoolToObject(make, "closed", closed);
     got = forgejo(a, "POST", path, make, 201, NULL);
     rc = !got;
-    if (got && !same_number(name, number, got))
+    if (got && !same_number(a, name, number, got))
         rc = 1;
     else if (got) {
         *made = 1;
@@ -328,7 +329,7 @@ static cJSON* github_pull(Aw* a, const char* name, int number) {
     char* path = aw_format("repos/%s/%s/pulls/%d", a->config->org, name, number);
     int status;
     cJSON* pull = github(a, path, &status);
-    if (!pull) aw_warn("%s: GitHub's pull request #%d could not be read (HTTP %d)", name, number, status);
+    if (!pull) aw_log("%s: GitHub's pull request #%d could not be read (HTTP %d)", name, number, status);
     free(path);
     return pull;
 }
@@ -422,7 +423,7 @@ static int settle(Aw* a, const char* name, int number, const cJSON* pull, const 
     now = !had || !strcmp(had, "open") ? "open" : !strcmp(had, "merged") ? "merged" : "closed";
     if (!strcmp(now, want)) return 0;
     if (!strcmp(now, "merged")) {
-        aw_warn("%s: #%d is merged here and %s on GitHub: it stays merged", name, number, want);
+        aw_log("%s: #%d is merged here and %s on GitHub: it stays merged", name, number, want);
         return 0;
     }
     if (!strcmp(now, "closed")) {
@@ -436,12 +437,12 @@ static int settle(Aw* a, const char* name, int number, const cJSON* pull, const 
         if (merge_pull(a, name, number, pull, &status))
             now = "merged";
         else if (status == 409) {
-            aw_warn("%s: #%d is merged on GitHub by %s, which %s here does not hold: it is closed here instead", name,
+            aw_log("%s: #%d is merged on GitHub by %s, which %s here does not hold: it is closed here instead", name,
                     number, commit ? commit : "no commit", base ? base : "its base");
             rc = set_state(a, name, number, 1);
             now = "closed";
         } else {
-            aw_warn("%s: #%d could not be marked merged (HTTP %d): the next pass", name, number, status);
+            aw_log("%s: #%d could not be marked merged (HTTP %d): the next pass", name, number, status);
             rc = 1;
         }
     } else if (!strcmp(want, "closed")) {
@@ -470,7 +471,7 @@ static int make_pull(Aw* a, const char* name, int number, const cJSON* issue, co
         cJSON_AddStringToObject(make, "base", jstr(cJSON_GetObjectItemCaseSensitive(pull, "base"), "ref"));
         cJSON_AddItemToObject(make, "labels", label_ids(issue, ids));
         got = forgejo(a, "POST", path, make, 201, NULL);
-        rc = !got || !same_number(name, number, got);
+        rc = !got || !same_number(a, name, number, got);
     }
     if (!rc) {
         *made = 1;
@@ -563,15 +564,16 @@ static int has_line(const char* list, const char* line) {
     return 0;
 }
 /* what the Forgejo has and GitHub has no more (stale, a ref a line, from aw_mirror): each one stays the grace from when
-   it was first seen gone, said then, and is deleted after it; one on GitHub again before that just stays. An
-   AW_KEPT_BRANCH one counts from when it was kept, which was said already. 0, or 1 (said) */
-static int grace(Aw* a, const char* name, cJSON* st, const char* stale) {
+   it was first seen gone, said then in the log, and is deleted after it; one on GitHub again before that just stays.
+   An AW_KEPT_BRANCH one counts from when it was kept. Said on standard error, for someone to see: the default branch
+   (main_branch) gone, or half of what GitHub had or more gone in one pass, 3 at least. 0, or 1 (said) */
+static int grace(Aw* a, const char* name, cJSON* st, const char* stale, const char* main_branch) {
     static const char kept_prefix[] = "refs/heads/" AW_KEPT_BRANCH "/";
     cJSON *gone = child(st, "gone"), *g, *next;
     const char *line, *end;
     char when[16], *to;
     Buf due = {0};
-    int rc = 0;
+    int rc = 0, now_gone = 0, left;
     if (!stale) return 0;
     for (g = gone->child; g; g = next) {
         next = g->next;
@@ -589,12 +591,24 @@ static int grace(Aw* a, const char* name, cJSON* st, const char* stale) {
         if (!cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(gone, ref))) {
             set_number(gone, ref, a->now);
             when_of(a->now + a->config->grace, "%Y-%m-%d", when, sizeof when);
-            if (a->config->grace && strncmp(ref, kept_prefix, sizeof kept_prefix - 1))
-                aw_warn("%s: %s is gone from GitHub: it stays here until %s, then it is deleted", name, ref, when);
+            if (strncmp(ref, kept_prefix, sizeof kept_prefix - 1)) {
+                ++now_gone;
+                if (main_branch && !strncmp(ref, "refs/heads/", 11) && !strcmp(ref + 11, main_branch))
+                    aw_warn("%s: the default branch %s is gone from GitHub: it stays here until %s, then it is deleted",
+                            name, main_branch, when);
+                else if (a->config->grace)
+                    aw_log("%s: %s is gone from GitHub: it stays here until %s, then it is deleted", name, ref, when);
+            }
         }
         since = cJSON_GetObjectItemCaseSensitive(gone, ref);
         if (a->now - (long)since->valuedouble >= a->config->grace) buf_printf(&due, "%s\n", ref);
         free(ref);
+    }
+    if (now_gone >= 3 && now_gone >= (left = aw_ref_count(a->config, name))) {
+        when_of(a->now + a->config->grace, "%Y-%m-%d", when, sizeof when);
+        aw_warn("%s: %d branches and tags gone from GitHub in one pass, %d left there: each stays here until %s, then "
+                "it is deleted (accordwimsy status lists them)",
+                name, now_gone, left, when);
     }
     if (due.len) {
         to = forgejo_git(a, name);
@@ -607,7 +621,7 @@ static int grace(Aw* a, const char* name, cJSON* st, const char* stale) {
             if (a->config->grace)
                 aw_log("%s: %s deleted here, gone from GitHub since %s", name, ref, when);
             else
-                aw_warn("%s: %s deleted here: GitHub has it no more", name, ref);
+                aw_log("%s: %s deleted here: GitHub has it no more", name, ref);
             cJSON_DeleteItemFromObjectCaseSensitive(gone, ref);
             free(ref);
         }
@@ -741,7 +755,7 @@ static int comments(Aw* a, const char* name, cJSON* st) {
         was = cJSON_GetObjectItemCaseSensitive(kept, key);
         cJSON_AddStringToObject(want, "body", body);
         if (number < 1 || number >= next) {
-            aw_warn("%s: comment %s is of #%d, which the Forgejo has not yet: the next pass", name, key, number);
+            aw_log("%s: comment %s is of #%d, which the Forgejo has not yet: the next pass", name, key, number);
             rc = 1;
         } else if (!was) {
             char* at = aw_format("repos/%s/%s/issues/%d/comments", a->config->forgejo_org, name, number);
@@ -779,7 +793,7 @@ static int comments(Aw* a, const char* name, cJSON* st) {
 
 /* ---- a pass ---- */
 static int one(Aw* a, const cJSON* repo, cJSON* repos) {
-    const char* name = jstr(repo, "name");
+    const char *name = jstr(repo, "name"), *main_branch = jstr(repo, "default_branch");
     char *from = github_git(a, name), *to = forgejo_git(a, name), *stale = NULL, *pulls = NULL, stamp[32];
     cJSON *st = child(repos, name), *ids = cJSON_CreateObject();
     int rc;
@@ -788,10 +802,20 @@ static int one(Aw* a, const cJSON* repo, cJSON* repos) {
         cJSON_DeleteItemFromObjectCaseSensitive(st, "missing");
     }
     when_of(a->now, "%Y%m%d-%H%M%S", stamp, sizeof stamp);
-    rc = ensure_repo(a, repo) || aw_mirror(a->config, name, from, to, stamp, &stale, &pulls) ||
-         patch_repo(a, repo) || labels(a, name, ids) || grace(a, name, st, stale) || keep_open(a, name, st, pulls) ||
-         issues(a, name, st, ids) || comments(a, name, st);
-    if (!rc) set_number(st, "ok", a->now);
+    a->numbers_off = 0;
+    rc = ensure_repo(a, repo) || aw_mirror(a->config, name, from, to, stamp, main_branch, &stale, &pulls) ||
+         patch_repo(a, repo) || labels(a, name, ids) || grace(a, name, st, stale, main_branch) ||
+         keep_open(a, name, st, pulls) || issues(a, name, st, ids) || comments(a, name, st);
+    if (!rc) {
+        set_number(st, "ok", a->now);
+        cJSON_DeleteItemFromObjectCaseSensitive(st, "numbers_off");
+    } else if (a->numbers_off && !cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(st, "numbers_off"))) {
+        /* the repository stops at the same number on every pass until someone empties its issues: said once */
+        set_number(st, "numbers_off", a->now);
+        aw_warn("%s: the Forgejo's issue numbers no longer match GitHub's: it stops there on every pass until its "
+                "issues start empty (its log says which number)",
+                name);
+    }
     save(a);
     cJSON_Delete(ids);
     free(stale);
@@ -841,13 +865,13 @@ int aw_sync(Aw* a) {
     cJSON *list = github_all(a, path), *repo, *repos = child(a->state, "repos");
     free(path);
     if (!list) {
-        aw_warn("the repositories of %s could not be listed: nothing done", a->config->org);
+        aw_log("the repositories of %s could not be listed: nothing done", a->config->org);
         return 1;
     }
     for (repo = list->child; repo; repo = repo->next) {
         if (!jstr(repo, "name")) continue;
         if (one(a, repo, repos)) {
-            aw_warn("%s: stopped, the rest of it on the next pass", jstr(repo, "name"));
+            aw_log("%s: stopped, the rest of it on the next pass", jstr(repo, "name"));
             a->failures++;
         }
     }
