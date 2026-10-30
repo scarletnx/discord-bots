@@ -73,7 +73,7 @@ YES, NO = chr(0x2705), chr(0x274C)
 # The owner's custom emoji (DraVee, 2026-10-21: "se alguem te citar, eu posso (somente eu) so responder com um
 # emoji"): his reaction with it, and only his, lets one stranger's message addressed to AogoWimsy reach the session.
 # Matched by its name; a constant, not a setting.
-WIMSY = 'wimsytetoutau'
+WIMSY = 'wimsyaogo'
 DM, THREADS, REPLY = 1, (10, 11, 12), 19  # channel types (a DM; the three threads) and a reply's message type
 SNOWFLAKE = re.compile(r'[0-9]{17,20}')
 TOKEN_LETTER = re.compile(r'[A-Za-z0-9._-]')

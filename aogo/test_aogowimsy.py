@@ -771,6 +771,17 @@ class Read(WithDiscord):
         named = self.tool('discord_read', channel=GENERAL, **{'from': [OWNER]})
         self.assertEqual((named['messages'], named['left_out']), ([], 4))
 
+    def test_only_the_wimsyaogo_reaction_lets_a_strangers_message_through(self):
+        mine = self.fake.say(GENERAL, BOT, 'a post of mine')
+        old = self.fake.say(GENERAL, STRANGER, 'with the old emoji', reply_to=mine)
+        new = self.fake.say(GENERAL, STRANGER, 'with the new one', reply_to=mine)
+        self.fake.react(old, 'wimsytetoutau:600000000000000002', OWNER)
+        self.fake.react(new, 'wimsyaogo:600000000000000001', OWNER)
+        got = self.tool('discord_read', channel=GENERAL)
+        self.assertEqual(aw.WIMSY, 'wimsyaogo')
+        self.assertEqual([(m['id'], m['approved']) for m in got['messages']], [(mine, False), (new, True)])
+        self.assertNotIn('with the old emoji', json.dumps(got))
+
     def test_a_message_the_owner_replied_to_mentioning_aogo_is_read_with_his_reply_in_the_page(self):
         start = self.fake.say(GENERAL, FRIEND, 'before')
         theirs = self.fake.say(GENERAL, STRANGER, 'a question for the room')
