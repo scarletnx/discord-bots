@@ -1,0 +1,93 @@
+# Public status of ScarletNX, at @STATUS_URL@: Gatus in the jail status on its host (it watches nothing that
+# host runs), its port reached only through the jail's own Cloudflare tunnel. The forge (git.scarletnx.dev) is
+# left out until the operator says how a checker gets past its challenge.
+metrics: false
+storage:
+  type: sqlite
+  # The port's rc runs Gatus as www from /: a directory www owns (install.sh makes it). On a phone,
+  # one in Termux's home.
+  path: /var/db/gatus/data.db
+# Every address of the jail: cloudflared reaches it on 127.0.0.1, the host's push.sh on the
+# jail's own address. Pushes need the token; the rest is the public page.
+web:
+  address: "@GATUS_LISTEN@"
+  port: 8080
+ui:
+  title: "Status - ScarletNX"
+  header: "ScarletNX"
+  logo: "@WIMSY_URL@"
+  # Wimsy in the tab too: ScarletNX's own icons, drawn from the same wimsy.svg.
+  favicon:
+    default: "@WIMSY_ICONS@/wimsy.ico"
+    size16x16: "@WIMSY_ICONS@/hicolor/16x16/apps/wimsy.png"
+    size32x32: "@WIMSY_ICONS@/hicolor/32x32/apps/wimsy.png"
+  link: "@PAGES_URL@/"
+  dashboard-heading: "Status"
+  dashboard-subheading: "ScarletNX's site, nightly release, Discord and bots."
+  custom-css: |
+    /* Wimsy's colours: colours.py makes these two lines from ScarletNX's dist/wimsy.svg. html:root
+       and html:root.dark outrank Gatus's :root and :root.dark. */
+    html:root{--primary:186.2 85.0% 30.6%;--primary-foreground:0.0 0.0% 100.0%;--ring:186.2 85.0% 30.6%}
+    html:root.dark{--primary:182.3 85.0% 58.2%;--primary-foreground:0.0 0.0% 0.0%;--ring:182.3 85.0% 58.2%}
+    /* The floating refresh and theme control sits over the last card on a phone: room below it. */
+    .dashboard-container{padding-bottom:5rem}
+    /* Each bot's icon before its name, wherever Gatus writes the name with it as the title; render.sh
+       puts icons/<bot>.png in as data, so the page loads no file from elsewhere. */
+    span[title="ReiWimsy"]::before,span[title="AccordWimsy"]::before{content:"";display:inline-block;width:1.5em;height:1.5em;margin-right:.4em;vertical-align:-.4em;background:center/contain no-repeat}
+    span[title="ReiWimsy"]::before{background-image:url(data:image/png;base64,@ICON_REIWIMSY@)}
+    span[title="AccordWimsy"]::before{background-image:url(data:image/png;base64,@ICON_ACCORDWIMSY@)}
+
+endpoints:
+  # scarletnx.dev sends everyone to the GitHub Pages site: the redirect itself is what is checked.
+  - name: scarletnx.dev
+    group: Web
+    url: "@SITE_URL@/"
+    interval: 5m
+    client:
+      ignore-redirect: true
+    conditions:
+      - "[STATUS] == 302"
+
+  - name: Site
+    group: Web
+    url: "@PAGES_URL@/"
+    interval: 5m
+    conditions:
+      - "[STATUS] == 200"
+      - "[BODY] == pat(*ScarletNX is a static recompiler*)"
+
+  # GitHub's API answers 60 calls an hour to an address without a token: this is 6.
+  - name: Nightly release
+    group: Downloads
+    url: "@NIGHTLY_API@"
+    interval: 10m
+    headers:
+      Accept: application/vnd.github+json
+    conditions:
+      - "[STATUS] == 200"
+      - "[BODY].tag_name == pat(nightly-*)"
+
+  # Discord's API says whether the invite the site links to still works.
+  - name: Discord invite
+    group: Community
+    url: "https://discord.com/api/v10/invites/@DISCORD_INVITE@"
+    interval: 30m
+    conditions:
+      - "[STATUS] == 200"
+      - "[BODY].code == @DISCORD_INVITE@"
+
+# The bots: pushed every minute by push.sh, from the host's cron; no push for 5 minutes reads as
+# down, so a push.sh that stops shows too. install.sh writes the token in from a root-only file of
+# the host's: it is never in this repository.
+external-endpoints:
+  - name: ReiWimsy
+    group: Bots
+    token: "@PUSH_TOKEN@"
+    heartbeat:
+      interval: 5m
+
+  - name: AccordWimsy
+    group: Bots
+    token: "@PUSH_TOKEN@"
+    heartbeat:
+      interval: 5m

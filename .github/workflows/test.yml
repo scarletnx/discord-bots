@@ -1,0 +1,24 @@
+name: Tests
+
+# ReiWimsy's tests (no Discord, no network, no Concord), AccordWimsy's (libcurl's headers, no network) and the docs'
+# check, on each pull request and each push to main
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: The bots' tests
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - run: make -C rei test
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libcurl4-openssl-dev
+      - run: make -C accordwimsy test
+      - run: sh scripts/test-check-docs.sh
+      - run: sh scripts/check-docs.sh

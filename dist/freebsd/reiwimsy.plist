@@ -1,0 +1,8 @@
+@owner root
+@group wheel
+@mode 755
+libexec/reiwimsy
+@mode 555
+etc/rc.d/reiwimsy
+@mode 644
+etc/reiwimsy.env.sample

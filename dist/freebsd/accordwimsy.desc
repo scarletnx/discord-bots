@@ -1,0 +1,4 @@
+AccordWimsy keeps a GitHub organization the same on a Forgejo: its repositories, branches
+and tags, labels, issues, comments and pull requests, a pass at a time from cron. Its
+settings are in /usr/local/etc/accordwimsy/accordwimsy.env, its cron line in
+/usr/local/share/examples/accordwimsy/accordwimsy.cron.

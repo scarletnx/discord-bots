@@ -1,0 +1,4 @@
+# AccordWimsy's logs, rotated at 1024 KB: copy to /usr/local/etc/newsyslog.conf.d/accordwimsy.conf
+# logfilename                          [owner:group]           mode count size when  flags
+/var/log/accordwimsy/accordwimsy.log   accordwimsy:accordwimsy 640  7     1024 *     JC
+/var/log/accordwimsy/accordwimsy.err   accordwimsy:accordwimsy 640  30    1024 *     JC

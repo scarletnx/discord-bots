@@ -1,0 +1,63 @@
+#!/bin/sh
+# Every minute, from /usr/local/etc/cron.d/status-scarletnx on the host (as root): whether each
+# bot is up, pushed to status.scarletnx.dev's Gatus at @GATUS_PUSH_URL@ (its external endpoints, group
+# Bots). Gatus marks one down when no push came for 5 minutes, so this script stopping shows there too.
+#   ReiWimsy: up when its rc variable in the jail discordbots says YES and its program has run
+#     there for a minute or more (a bot daemon(8) restarts every 30 s reads as down).
+#   AccordWimsy: up when `noirjail.sh jail fresh` passes (each mirror had a good pass within its time).
+# The token is in a root-only file, as the whole header curl sends: never on a command line.
+set -u
+header=/usr/local/etc/status-scarletnx/push-header
+jails=/usr/local/bastille/jails
+
+# Pushes <success> (true or false) for endpoint <key>, with <error> when there is one; a push that
+# fails is said on stderr (cron's log), with curl's own words.
+# Usage: push <key> <success> [error]
+push() {
+	if ! _p_out=$(curl -sS -m 10 -X POST -G -H "@$header" --data-urlencode "success=$2" \
+		--data-urlencode "error=${3:-}" "@GATUS_PUSH_URL@/api/v1/endpoints/$1/external" 2>&1); then
+		echo "$(date '+%F %T') $1: the push failed: $_p_out" >&2
+	fi
+}
+
+# The seconds the longest-running process of the jail discordbots whose command is <command> has run,
+# or nothing when none runs it.
+# Usage: age <command>
+age() {
+	# awk: the largest elapsed time of the rows whose command, the rest of the line, is c.
+	ps -J discordbots -o etimes= -o command= 2> /dev/null | awk -v c="$1" '
+		{ e = $1 + 0; sub(/^[ \t]*[0-9]+[ \t]+/, "") }
+		$0 == c { if (!f || e > m) m = e; f = 1 }
+		END { if (f) print m }'
+}
+
+# Pushes bot <key>: down when <rcvar> is not YES in discordbots' rc.conf, or <command> runs there
+# for less than a minute or not at all.
+# Usage: bot <key> <rcvar> <command>
+bot() {
+	if ! grep -Eq "^$2=\"?[Yy][Ee][Ss]\"?$" "$jails/discordbots/root/etc/rc.conf" 2> /dev/null; then
+		push "$1" false "turned off: $2 is not YES in discordbots"
+		return
+	fi
+	_b_age=$(age "$3")
+	if [ -z "$_b_age" ]; then
+		push "$1" false "not running in discordbots"
+	elif [ "$_b_age" -lt 60 ]; then
+		push "$1" false "running for $_b_age s only: restarted"
+	else
+		push "$1" true
+	fi
+}
+
+if [ ! -r "$header" ]; then
+	echo "$(date '+%F %T') no $header: run install.sh" >&2
+	exit 78
+fi
+bot bots_reiwimsy reiwimsy_enable /usr/local/libexec/reiwimsy
+esc=$(printf '\033')
+if _f_out=$(/usr/local/libexec/noirjail/noirjail.sh jail fresh --auto 2>&1); then
+	push bots_accordwimsy true
+else
+	# sed: the first line that says what is late, without its colours.
+	push bots_accordwimsy false "$(printf '%s\n' "$_f_out" | sed -n "s/${esc}\[[0-9;]*m//g; /✗/{s/^ *✗ //p;q;}")"
+fi

@@ -1,0 +1,16 @@
+# the user its passes run as, its state and log folders and an env file to fill in, made once; PKG_ROOTDIR when pkg
+# installs into another root
+r=${PKG_ROOTDIR:-}
+pw -R "${r:-/}" groupshow accordwimsy > /dev/null 2>&1 || pw -R "${r:-/}" groupadd accordwimsy
+pw -R "${r:-/}" usershow accordwimsy > /dev/null 2>&1 ||
+	pw -R "${r:-/}" useradd accordwimsy -g accordwimsy -c "AccordWimsy" -d /var/db/accordwimsy -s /usr/sbin/nologin
+install -d -o accordwimsy -g accordwimsy -m 700 "$r/var/db/accordwimsy"
+install -d -o root -g wheel -m 755 "$r/var/log/accordwimsy"
+for f in accordwimsy.log accordwimsy.err accordwimsy.fresh; do
+	[ -e "$r/var/log/accordwimsy/$f" ] || install -o accordwimsy -g accordwimsy -m 640 /dev/null "$r/var/log/accordwimsy/$f"
+done
+if [ ! -e "$r${PKG_PREFIX}/etc/accordwimsy/accordwimsy.env" ]; then
+	install -o accordwimsy -g accordwimsy -m 600 "$r${PKG_PREFIX}/etc/accordwimsy/accordwimsy.env.sample" \
+		"$r${PKG_PREFIX}/etc/accordwimsy/accordwimsy.env"
+	echo "accordwimsy: fill in ${PKG_PREFIX}/etc/accordwimsy/accordwimsy.env, then copy its cron line and log rotation from ${PKG_PREFIX}/share/examples/accordwimsy"
+fi

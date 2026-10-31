@@ -1,0 +1,3 @@
+*.o
+/accordwimsy
+/tests/test_aw

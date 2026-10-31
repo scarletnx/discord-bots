@@ -1,0 +1,35 @@
+#!/bin/sh
+# PROVIDE: reiwimsy
+# REQUIRE: LOGIN NETWORKING
+# KEYWORD: shutdown
+#
+# The ReiWimsy Discord bot, run by daemon(8) as the reiwimsy user, started again when it stops; its output in syslog.
+# Its tokens and channels are in reiwimsy_env_file (root's, mode 600), which rc.subr exports to it; what it keeps of
+# its replies and its cards, in reiwimsy_state (its own folder, which only it reads).
+
+. /etc/rc.subr
+
+name=reiwimsy
+rcvar=reiwimsy_enable
+load_rc_config $name
+
+: ${reiwimsy_enable:=NO}
+: ${reiwimsy_env_file:=/usr/local/etc/reiwimsy.env}
+: ${reiwimsy_state:=/var/db/reiwimsy/state.json}
+
+pidfile=/var/run/${name}.pid
+command=/usr/sbin/daemon
+command_args="-f -r -R 30 -S -T ${name} -u ${name} -P ${pidfile} /usr/local/libexec/${name}"
+start_precmd="${name}_precmd"
+
+reiwimsy_precmd()
+{
+	if [ ! -s "${reiwimsy_env_file}" ] || grep -q '^[^#]*=$' "${reiwimsy_env_file}"; then
+		echo "${reiwimsy_env_file} lacks a value: fill it in first"
+		return 1
+	fi
+	install -d -o reiwimsy -g reiwimsy -m 700 "$(dirname "${reiwimsy_state}")"
+	export REIWIMSY_STATE="${reiwimsy_state}"
+}
+
+run_rc_command "$1"

@@ -1,0 +1,4 @@
+# AccordWimsy's pass every 10 minutes, its output in /var/log/accordwimsy: copy to /usr/local/etc/cron.d/accordwimsy
+# once its env file is filled in. MAILTO="": no mail from cron, which would start a mailer in the jail.
+MAILTO=""
+*/10 * * * * accordwimsy /usr/local/bin/accordwimsy sync >>/var/log/accordwimsy/accordwimsy.log 2>>/var/log/accordwimsy/accordwimsy.err

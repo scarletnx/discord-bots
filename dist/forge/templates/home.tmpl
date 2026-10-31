@@ -1,0 +1,88 @@
+{{/* git.scarletnx.dev's start page: scarletnx.github.io's text and links (its index.html), with every CI image the nightly release has, the bots (their avatars in public/assets/img/bots) and the copies on this forge, in Forgejo 17's frame (templates/home.tmpl). One column that wraps to a phone's width; colours from Forgejo's theme variables, so light and dark both work. Wimsy is ScarletNX's dist/wimsy.svg, served from here. */}}
+{{template "base/head" .}}
+<style>
+.sx-home { max-width: 56rem; margin: 0 auto; padding: 1.5rem 1rem 3rem; text-align: center; line-height: 1.5; overflow-wrap: anywhere; }
+.sx-home a { color: var(--color-primary); }
+.sx-home .sx-wimsy { display: block; width: min(100%, 16rem); height: auto; margin: 0 auto 1.25rem; }
+.sx-home .sx-row { display: flex; flex-wrap: wrap; justify-content: center; gap: .25rem 1.5rem; margin: 0 0 1rem; padding: 0; list-style: none; }
+.sx-home .sx-top { font-size: 1.3rem; font-weight: 600; }
+.sx-home .sx-motto { font-style: italic; font-size: 1.15rem; margin: 0 0 1rem; }
+.sx-home h2 { font-size: 1.1rem; margin: 2rem 0 .75rem; }
+.sx-home .sx-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); gap: .5rem; margin: 0; padding: 0; list-style: none; }
+.sx-home .sx-grid li { display: flex; }
+.sx-home .sx-grid a { flex: 1; display: flex; align-items: center; justify-content: center; padding: .6rem .75rem; border: 1px solid var(--color-secondary); border-radius: var(--border-radius); background: var(--color-box-body); }
+.sx-home .sx-grid a:hover { background: var(--color-hover); text-decoration: none; }
+.sx-home .sx-note { color: var(--color-text-light-2); font-size: .9rem; margin: 0 0 .75rem; }
+.sx-home .sx-bots { display: flex; flex-wrap: wrap; justify-content: center; gap: 1rem 1.5rem; margin: 0 0 1rem; padding: 0; list-style: none; }
+.sx-home .sx-bots li { width: 10rem; display: flex; flex-direction: column; align-items: center; gap: .25rem; }
+.sx-home .sx-bots img { width: 4rem; height: 4rem; }
+.sx-home .sx-bots a { font-weight: 600; }
+.sx-home .sx-bots span { color: var(--color-text-light-2); font-size: .85rem; line-height: 1.35; }
+</style>
+<div role="main" aria-label="{{if .IsSigned}}{{ctx.Locale.Tr "dashboard"}}{{else}}{{ctx.Locale.Tr "home"}}{{end}}" class="page-content home">
+	<div class="sx-home">
+		<img class="sx-wimsy" src="{{AssetUrlPrefix}}/img/wimsy.svg" width="512" height="512" alt="Wimsy, the mascot of ScarletNX">
+		<ul class="sx-row sx-top">
+			<li><a href="https://github.com/scarletnx/ScarletNX">Source code</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest">Nightly release</a></li>
+			<li><a href="https://discord.gg/tRTRXXbyjp">Discord</a></li>
+		</ul>
+		<p class="sx-motto">
+			If a Switch is an ARM64-verse.<br>
+			Then ScarletNX is FEX but in reverse.
+		</p>
+		<p>
+			ScarletNX is a static recompiler for Switch and Linux ARM programs.<br>
+			Runs on FreeBSD, Android, Windows, Linux, Solaris, NetBSD, OpenBSD, DragonFlyBSD, and AIX!<br>
+			Runs on x86_64, aarch64, powerpc64le, riscv64, mips64, loongarch64, sparc64, and DEC Alpha!<br>
+			Stay tuned on our Discord for updates.
+		</p>
+
+		<h2>We offer the following CI images:</h2>
+		<ul class="sx-grid">
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-windows-x86_64.zip">Windows x86_64</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-macos-arm64.zip">macOS arm64</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-linux-x86_64.AppImage">Linux x86_64</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-linux-aarch64.AppImage">Linux aarch64</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-linux-riscv64.AppImage">Linux riscv64</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-linux-ppc64.AppImage">Linux ppc64 (ELFv2)</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-linux-ppc64le.AppImage">Linux ppc64le</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-linux-loongarch64.AppImage">Linux loongarch64</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-android-universal.apk">Android (x86_64, aarch64)</a></li>
+			<li><a href="https://github.com/scarletnx/nightly/releases/latest/download/ScarletNX-ios-arm64.ipa">iOS arm64</a></li>
+		</ul>
+
+		<h2>Getting started:</h2>
+		<ul class="sx-row">
+			<li><a href="https://github.com/scarletnx/ScarletNX/blob/main/docs/USAGE.md">Usage</a></li>
+			<li><a href="https://github.com/scarletnx/ScarletNX/blob/main/docs/BUILD.md">Build from source</a></li>
+			<li><a href="https://github.com/scarletnx/ScarletNX/issues/new?template=game-report.yml">Report a game</a></li>
+		</ul>
+
+		<h2>Bots:</h2>
+		<ul class="sx-bots">
+			<li>
+				<img src="{{AssetUrlPrefix}}/img/bots/reiwimsy.png" width="128" height="128" alt="">
+				<a href="{{AppSubUrl}}/scarletnx/wimsy-core/src/branch/main/rei">ReiWimsy</a>
+				<span>Links the issues and pull requests a message names, and keeps a card on the Discord for each one open.</span>
+			</li>
+			<li>
+				<img src="{{AssetUrlPrefix}}/img/bots/accordwimsy.png" width="128" height="128" alt="">
+				<a href="{{AppSubUrl}}/scarletnx/wimsy-core/src/branch/main/accordwimsy">AccordWimsy</a>
+				<span>Keeps this forge the same as the GitHub organization, every 10 minutes.</span>
+			</li>
+		</ul>
+		<p class="sx-note">Whether they, the site and the downloads are up: <a href="https://status.scarletnx.dev">status.scarletnx.dev</a></p>
+
+		<h2>On this forge:</h2>
+		<p class="sx-note">A copy of the GitHub organization, code, issues and pull requests, kept the same every 10 minutes. Releases stay on GitHub.</p>
+		<ul class="sx-row">
+			<li><a href="{{AppSubUrl}}/scarletnx/ScarletNX">ScarletNX</a></li>
+			<li><a href="{{AppSubUrl}}/scarletnx/nightly">nightly</a></li>
+			<li><a href="{{AppSubUrl}}/scarletnx/wimsy-core">wimsy-core</a></li>
+			<li><a href="{{AppSubUrl}}/scarletnx/edenprobe">edenprobe</a></li>
+			<li><a href="{{AppSubUrl}}/scarletnx/scarletnx.github.io">scarletnx.github.io</a></li>
+		</ul>
+	</div>
+</div>
+{{template "base/footer" .}}

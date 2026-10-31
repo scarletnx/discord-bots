@@ -1,0 +1,10 @@
+@owner root
+@group wheel
+@mode 755
+bin/accordwimsy
+@mode 644
+etc/accordwimsy/accordwimsy.env.sample
+share/examples/accordwimsy/accordwimsy.cron
+share/examples/accordwimsy/accordwimsy.newsyslog
+@dir share/examples/accordwimsy
+@dir etc/accordwimsy

@@ -1,0 +1,93 @@
+# Public status of ScarletNX, at https://status.scarletnx.dev: Gatus in the jail status on its host (it watches nothing that
+# host runs), its port reached only through the jail's own Cloudflare tunnel. The forge (git.scarletnx.dev) is
+# left out until the operator says how a checker gets past its challenge.
+metrics: false
+storage:
+  type: sqlite
+  # The port's rc runs Gatus as www from /: a directory www owns (install.sh makes it). On a phone,
+  # one in Termux's home.
+  path: /var/db/gatus/data.db
+# Every address of the jail: cloudflared reaches it on 127.0.0.1, the host's push.sh on the
+# jail's own address. Pushes need the token; the rest is the public page.
+web:
+  address: "0.0.0.0"
+  port: 8080
+ui:
+  title: "Status - ScarletNX"
+  header: "ScarletNX"
+  logo: "https://raw.githubusercontent.com/scarletnx/ScarletNX/refs/heads/main/dist/wimsy.svg"
+  # Wimsy in the tab too: ScarletNX's own icons, drawn from the same wimsy.svg.
+  favicon:
+    default: "https://raw.githubusercontent.com/scarletnx/ScarletNX/refs/heads/main/dist/icons/wimsy.ico"
+    size16x16: "https://raw.githubusercontent.com/scarletnx/ScarletNX/refs/heads/main/dist/icons/hicolor/16x16/apps/wimsy.png"
+    size32x32: "https://raw.githubusercontent.com/scarletnx/ScarletNX/refs/heads/main/dist/icons/hicolor/32x32/apps/wimsy.png"
+  link: "https://scarletnx.github.io/"
+  dashboard-heading: "Status"
+  dashboard-subheading: "ScarletNX's site, nightly release, Discord and bots."
+  custom-css: |
+    /* Wimsy's colours: colours.py makes these two lines from ScarletNX's dist/wimsy.svg. html:root
+       and html:root.dark outrank Gatus's :root and :root.dark. */
+    html:root{--primary:186.2 85.0% 30.6%;--primary-foreground:0.0 0.0% 100.0%;--ring:186.2 85.0% 30.6%}
+    html:root.dark{--primary:182.3 85.0% 58.2%;--primary-foreground:0.0 0.0% 0.0%;--ring:182.3 85.0% 58.2%}
+    /* The floating refresh and theme control sits over the last card on a phone: room below it. */
+    .dashboard-container{padding-bottom:5rem}
+    /* Each bot's icon before its name, wherever Gatus writes the name with it as the title; render.sh
+       puts icons/<bot>.png in as data, so the page loads no file from elsewhere. */
+    span[title="ReiWimsy"]::before,span[title="AccordWimsy"]::before{content:"";display:inline-block;width:1.5em;height:1.5em;margin-right:.4em;vertical-align:-.4em;background:center/contain no-repeat}
+    span[title="ReiWimsy"]::before{background-image:url(data:image/png;base64,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)}
+    span[title="AccordWimsy"]::before{background-image:url(data:image/png;base64,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)}
+
+endpoints:
+  # scarletnx.dev sends everyone to the GitHub Pages site: the redirect itself is what is checked.
+  - name: scarletnx.dev
+    group: Web
+    url: "https://scarletnx.dev/"
+    interval: 5m
+    client:
+      ignore-redirect: true
+    conditions:
+      - "[STATUS] == 302"
+
+  - name: Site
+    group: Web
+    url: "https://scarletnx.github.io/"
+    interval: 5m
+    conditions:
+      - "[STATUS] == 200"
+      - "[BODY] == pat(*ScarletNX is a static recompiler*)"
+
+  # GitHub's API answers 60 calls an hour to an address without a token: this is 6.
+  - name: Nightly release
+    group: Downloads
+    url: "https://api.github.com/repos/scarletnx/nightly/releases/latest"
+    interval: 10m
+    headers:
+      Accept: application/vnd.github+json
+    conditions:
+      - "[STATUS] == 200"
+      - "[BODY].tag_name == pat(nightly-*)"
+
+  # Discord's API says whether the invite the site links to still works.
+  - name: Discord invite
+    group: Community
+    url: "https://discord.com/api/v10/invites/tRTRXXbyjp"
+    interval: 30m
+    conditions:
+      - "[STATUS] == 200"
+      - "[BODY].code == tRTRXXbyjp"
+
+# The bots: pushed every minute by push.sh, from the host's cron; no push for 5 minutes reads as
+# down, so a push.sh that stops shows too. install.sh writes the token in from a root-only file of
+# the host's: it is never in this repository.
+external-endpoints:
+  - name: ReiWimsy
+    group: Bots
+    token: "@PUSH_TOKEN@"
+    heartbeat:
+      interval: 5m
+
+  - name: AccordWimsy
+    group: Bots
+    token: "@PUSH_TOKEN@"
+    heartbeat:
+      interval: 5m

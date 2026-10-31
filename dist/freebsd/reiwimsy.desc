@@ -1,0 +1,4 @@
+ReiWimsy answers a Discord message that names an issue or a pull request of a GitHub
+repository with a link to each, its title, state and labels, and keeps a card on Discord
+for each open pull request, each open issue and each nightly build, edited as GitHub
+changes. It runs as the service reiwimsy, its settings in /usr/local/etc/reiwimsy.env.

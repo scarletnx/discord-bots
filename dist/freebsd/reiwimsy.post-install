@@ -1,0 +1,9 @@
+# the user the service runs as, and an env file to fill in, made once; PKG_ROOTDIR when pkg installs into another root
+r=${PKG_ROOTDIR:-}
+pw -R "${r:-/}" groupshow reiwimsy > /dev/null 2>&1 || pw -R "${r:-/}" groupadd reiwimsy
+pw -R "${r:-/}" usershow reiwimsy > /dev/null 2>&1 ||
+	pw -R "${r:-/}" useradd reiwimsy -g reiwimsy -c "ReiWimsy Discord bot" -d /nonexistent -s /usr/sbin/nologin
+if [ ! -e "$r${PKG_PREFIX}/etc/reiwimsy.env" ]; then
+	install -m 600 "$r${PKG_PREFIX}/etc/reiwimsy.env.sample" "$r${PKG_PREFIX}/etc/reiwimsy.env"
+	echo "reiwimsy: fill in ${PKG_PREFIX}/etc/reiwimsy.env, then: sysrc reiwimsy_enable=YES; service reiwimsy start"
+fi
