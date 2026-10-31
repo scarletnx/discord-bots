@@ -1,20 +1,20 @@
 #!/bin/sh
-# Installs or updates the Discord bots in their Bastille jail, on the host it runs on (as root):
+# Installs or updates ReiWimsy in its Bastille jail, on the host it runs on (as root):
 #
 #   sh install.sh [JAIL]          default: discordbots
 #
 # The jail is made once, with Bastille or the host's own tool for jails, for example:
 #   bastille create discordbots 15.1-RELEASE <ip> <interface>
-# The bots only go out: Discord, GitHub, xAI.
+# The bot only goes out: Discord, GitHub.
 #
-# Run from this folder, which holds reiwimsy.rc, xuji.rc and the .env examples, with ../rei and ../xuji beside it.
+# Run from this folder, which holds reiwimsy.rc and its .env example, with ../rei beside it.
 # ReiWimsy is built in the jail: Concord (CONCORD_VERSION, cloned with its reflect-c submodule, both checked against
 # their pinned commits: its Makefile runs git submodule, which a release tarball cannot), with the fixes CONCORD_PATCHES
 # names over it (each one Concord does not have yet, its tests CONCORD_TESTS run before Concord is installed) once into
 # /usr/local/reiwimsy-concord, then ../rei, its tests run before it is installed. Again it changes only what changed:
-# the jail and its users are made once, Concord built once a version and set of patches, the code and the services
-# copied, and an env file that is there is left as it is (the tokens are in it). A service starts only once its env
-# file is filled in: service reiwimsy start, service xuji start, inside the jail (bastille cmd JAIL service NAME start).
+# the jail and its user are made once, Concord built once a version and set of patches, the code and the service
+# copied, and an env file that is there is left as it is (the tokens are in it). The service starts only once its
+# env file is filled in: service reiwimsy start, inside the jail (bastille cmd JAIL service reiwimsy start).
 #
 # linkbot, the Python bot ReiWimsy replaces, is taken over once: stopped, its linkbot_enable set to NO, its env file's
 # LINKBOT_ keys copied as REIWIMSY_ ones into reiwimsy.env. Its files stay where they are (/usr/local/etc/linkbot.env,
@@ -39,7 +39,7 @@ if ! jls -j "$jail" jid >/dev/null 2>&1; then
 	echo "$jail is not running: make it (bastille create), or start it (bastille start $jail)" >&2
 	exit 1
 fi
-bastille pkg "$jail" install -y py312-discord.py curl gmake pkgconf git
+bastille pkg "$jail" install -y curl gmake pkgconf git
 
 # Concord, once a version and set of patches: its VERSION file names both
 patches=$(cd "$here" && cat $CONCORD_PATCHES | sha256)
@@ -105,15 +105,4 @@ if [ ! -e "$root/usr/local/etc/reiwimsy.env" ]; then
 fi
 # on at its first install; a NO set since (the bot left off) stays
 jexec "$jail" sysrc -n reiwimsy_enable >/dev/null 2>&1 || bastille sysrc "$jail" reiwimsy_enable=YES >/dev/null
-
-# Xuji, as it was
-bastille cmd "$jail" pw usershow xuji >/dev/null 2>&1 ||
-	bastille cmd "$jail" pw useradd xuji -c "xuji Discord bot" -d /nonexistent -s /usr/sbin/nologin
-install -m 755 "$here/../xuji/xuji.py" "$root/usr/local/libexec/xuji.py"
-install -m 555 "$here/xuji.rc" "$root/usr/local/etc/rc.d/xuji"
-if [ ! -e "$root/usr/local/etc/xuji.env" ]; then
-	install -m 600 "$here/xuji.env.example" "$root/usr/local/etc/xuji.env"
-	echo "xuji: fill in $root/usr/local/etc/xuji.env, then: bastille cmd $jail service xuji start"
-fi
-jexec "$jail" sysrc -n xuji_enable >/dev/null 2>&1 || bastille sysrc "$jail" xuji_enable=YES >/dev/null
 echo "$jail: installed"
